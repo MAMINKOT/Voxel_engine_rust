@@ -1,0 +1,49 @@
+[package]
+name = "voxel-industrial-engine"
+version = "0.1.0"
+edition = "2021"
+authors = ["Voxel Engine Team"]
+description = "High-performance monolithic 3D voxel-engineering engine (DOD architecture)"
+
+[[bin]]
+name = "voxel-engine"
+path = "src/main.rs"
+
+[dependencies]
+# Window & Input management
+winit = "0.29"
+
+# Low-level GPU API (Vulkan / Metal / DX12 backend)
+wgpu = "0.19"
+
+# Safe byte casting of vertex data
+bytemuck = { version = "1", features = ["derive"] }
+
+# Math: vectors, matrices, quaternions
+glam = "0.25"
+
+# Blocking async WGPU calls in main
+pollster = "0.3"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Immediate-mode UI
+egui = "0.27"
+egui-wgpu = "0.27"
+
+# Data-parallel world generation & greedy meshing
+rayon = "1.10"
+
+# Process & system RAM monitoring for F3 debug overlay
+sysinfo = "0.30"
+
+[profile.dev]
+opt-level = 1          # faster incremental builds with some optimisations
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

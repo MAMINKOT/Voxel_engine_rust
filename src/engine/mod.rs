@@ -1,0 +1,770 @@
+// engine/mod.rs — Central EngineState.
+//
+// winit 0.29 API:
+//   • EventLoop::run(|event, elwt| { … })  — 2 args, no control_flow param
+//   • elwt.exit() instead of ControlFlow::Exit
+//   • Event::AboutToWait instead of MainEventsCleared
+//   • ControlFlow set via elwt.set_control_flow()
+//
+// WGPU 0.19: Surface<'static> via Arc<Window>.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use glam::Vec3;
+use sysinfo::{Pid, System};
+use winit::dpi::PhysicalSize;
+use winit::event::{
+    DeviceEvent, ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+};
+use winit::event_loop::{ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{CursorGrabMode, Window, WindowBuilder};
+
+use crate::camera::{Camera, CameraController, CameraUniform};
+use crate::inventory::PlayerInventory;
+use crate::player::Player;
+use crate::render::overlay::OverlayRenderer;
+use crate::render::pipeline::{
+    create_camera_bind_group, create_camera_bind_group_layout, create_camera_buffer,
+    create_render_pipeline, create_sky_pipeline, create_translucent_pipeline, DepthTexture,
+};
+use crate::render::sky::SkyState;
+use crate::render::ui::{UiScreen, UiSystem};
+use crate::sim::energy_net::TICK_DT;
+use crate::ui::debug::DebugInfo;
+use crate::voxel::chunk::{is_fluid, is_placeable, AIR, FIRE, LIGHTER, TNT, WATER};
+use crate::voxel::raycast::{raycast_blocks, RaycastHit};
+use crate::voxel::world::World;
+
+// ─── FPS Counter ─────────────────────────────────────────────────────────────
+
+struct FpsCounter {
+    frame_count: u32,
+    elapsed: Duration,
+    last_fps: f64,
+}
+
+impl FpsCounter {
+    fn new() -> Self {
+        Self { frame_count: 0, elapsed: Duration::ZERO, last_fps: 0.0 }
+    }
+
+    /// Call once per frame; returns `Some(fps)` once per second.
+    fn tick(&mut self, dt: Duration) -> Option<f64> {
+        self.frame_count += 1;
+        self.elapsed += dt;
+        if self.elapsed >= Duration::from_secs(1) {
+            let fps = self.frame_count as f64 / self.elapsed.as_secs_f64();
+            self.frame_count = 0;
+            self.elapsed = Duration::ZERO;
+            self.last_fps = fps;
+            Some(fps)
+        } else {
+            None
+        }
+    }
+}
+
+// ─── GPU State ───────────────────────────────────────────────────────────────
+
+struct GpuState {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    sky_pipeline: wgpu::RenderPipeline,
+    render_pipeline: wgpu::RenderPipeline,
+    translucent_pipeline: wgpu::RenderPipeline,
+    depth_texture: DepthTexture,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    world: World,
+    overlay: OverlayRenderer,
+    ui: UiSystem,
+}
+
+// ─── Engine ───────────────────────────────────────────────────────────────────
+
+/// Maximum block interaction distance.
+const REACH: f32 = 6.0;
+
+struct Engine {
+    window: Arc<Window>,
+    gpu: GpuState,
+    camera: Camera,
+    camera_ctrl: CameraController,
+    sky: SkyState,
+    player: Player,
+    inventory: PlayerInventory,
+    target: Option<RaycastHit>,
+    tick_accum: f32,
+    last_frame: Instant,
+    last_dt_secs: f32,
+    fps_counter: FpsCounter,
+    sys: System,
+    pid: Option<Pid>,
+    used_process_mb: u64,
+    total_system_mb: u64,
+    mem_percent: f32,
+    cursor_grabbed: bool,
+}
+
+impl Engine {
+    // ── Cursor capture & UI modal helpers ─────────────────────────────────
+
+    fn grab_cursor(&mut self, grab: bool) {
+        if grab {
+            if self.window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                let _ = self.window.set_cursor_grab(CursorGrabMode::Confined);
+            }
+            self.window.set_cursor_visible(false);
+        } else {
+            let _ = self.window.set_cursor_grab(CursorGrabMode::None);
+            self.window.set_cursor_visible(true);
+        }
+        self.cursor_grabbed = grab;
+    }
+
+    fn open_ui(&mut self, screen: UiScreen) {
+        self.gpu.ui.screen = screen;
+        self.camera_ctrl.clear_input();
+        self.player.reset_inputs();
+        self.grab_cursor(false);
+    }
+
+    fn close_ui(&mut self, recapture_mouse: bool) {
+        self.gpu.ui.screen = UiScreen::Closed;
+        for leftover in self.inventory.return_cursor_and_crafting() {
+            self.gpu
+                .world
+                .drops
+                .spawn(self.player.center(), leftover.id, leftover.count);
+        }
+        if recapture_mouse {
+            self.grab_cursor(true);
+        }
+    }
+
+    // ── Resize ────────────────────────────────────────────────────────────
+
+    fn resize(&mut self, new_size: PhysicalSize<u32>) {
+        if new_size.width == 0 || new_size.height == 0 {
+            return;
+        }
+        self.gpu.config.width = new_size.width;
+        self.gpu.config.height = new_size.height;
+        self.gpu.surface.configure(&self.gpu.device, &self.gpu.config);
+        self.gpu.depth_texture = DepthTexture::create(
+            &self.gpu.device,
+            new_size.width,
+            new_size.height,
+            "depth_texture",
+        );
+        self.camera.set_aspect(new_size.width, new_size.height);
+        self.gpu.overlay.resize(&self.gpu.queue, new_size.width, new_size.height);
+    }
+
+    // ── Window title / HUD & RAM refresh ──────────────────────────────────
+
+    fn refresh_memory_stats(&mut self) {
+        if let Some(pid) = self.pid {
+            self.sys.refresh_process(pid);
+            if let Some(proc_info) = self.sys.process(pid) {
+                self.used_process_mb = proc_info.memory() / (1024 * 1024);
+            }
+        }
+        self.total_system_mb = (self.sys.total_memory() / (1024 * 1024)).max(1);
+        self.mem_percent =
+            (self.used_process_mb as f32 / self.total_system_mb as f32) * 100.0;
+    }
+
+    fn refresh_title(&self) {
+        let machine_info = self
+            .target
+            .and_then(|hit| self.gpu.world.energy.status(hit.block_pos));
+        let title = match machine_info {
+            Some(status) => format!(
+                "Voxel Industrial Engine | FPS: {:.0} | {} | {}",
+                self.fps_counter.last_fps,
+                self.inventory.status_line(),
+                status
+            ),
+            None => format!(
+                "Voxel Industrial Engine | FPS: {:.0} | {}",
+                self.fps_counter.last_fps,
+                self.inventory.status_line()
+            ),
+        };
+        self.window.set_title(&title);
+    }
+
+    // ── Input ─────────────────────────────────────────────────────────────
+
+    fn handle_key(&mut self, event: &KeyEvent) {
+        if event.state == ElementState::Pressed && !event.repeat {
+            if let PhysicalKey::Code(code) = event.physical_key {
+                // F3: toggle diagnostic debug overlay.
+                if code == KeyCode::F3 {
+                    self.gpu.ui.debug_open = !self.gpu.ui.debug_open;
+                    return;
+                }
+                // T: step day/night time forward by +150s for quick testing of sunrise/noon/sunset/night.
+                if code == KeyCode::KeyT && !self.gpu.ui.is_open() {
+                    self.sky.skip(150.0);
+                    return;
+                }
+                // Escape: close UI if open, otherwise release cursor.
+                if code == KeyCode::Escape {
+                    if self.gpu.ui.is_open() {
+                        self.close_ui(true);
+                    } else {
+                        self.grab_cursor(false);
+                    }
+                    return;
+                }
+                // E / I / Tab: toggle inventory / close machine UI.
+                if matches!(code, KeyCode::KeyE | KeyCode::KeyI | KeyCode::Tab) {
+                    if self.gpu.ui.is_open() {
+                        self.close_ui(true);
+                    } else {
+                        self.open_ui(UiScreen::Inventory);
+                    }
+                    return;
+                }
+                // 1-9: select hotbar slot.
+                let slot = match code {
+                    KeyCode::Digit1 => Some(0),
+                    KeyCode::Digit2 => Some(1),
+                    KeyCode::Digit3 => Some(2),
+                    KeyCode::Digit4 => Some(3),
+                    KeyCode::Digit5 => Some(4),
+                    KeyCode::Digit6 => Some(5),
+                    KeyCode::Digit7 => Some(6),
+                    KeyCode::Digit8 => Some(7),
+                    KeyCode::Digit9 => Some(8),
+                    _ => None,
+                };
+                if let Some(idx) = slot {
+                    self.inventory.select(idx);
+                    self.refresh_title();
+                }
+            }
+        }
+        // Only feed movement keys when no UI window is open.
+        if !self.gpu.ui.is_open() {
+            self.camera_ctrl.process_keyboard(event);
+        }
+    }
+
+    fn handle_scroll(&mut self, delta: &MouseScrollDelta) {
+        if self.gpu.ui.is_open() {
+            return;
+        }
+        let scroll = match delta {
+            MouseScrollDelta::LineDelta(_, y) => *y,
+            MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.05,
+        };
+        if scroll > 0.0 {
+            self.inventory.cycle(-1);
+            self.refresh_title();
+        } else if scroll < 0.0 {
+            self.inventory.cycle(1);
+            self.refresh_title();
+        }
+    }
+
+    /// First click captures the cursor; afterwards LMB breaks and RMB opens machine UI or places.
+    fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
+        if self.gpu.ui.is_open() {
+            self.gpu.ui.on_mouse_button(button, state);
+            return;
+        }
+        if state != ElementState::Pressed {
+            return;
+        }
+        if !self.cursor_grabbed {
+            self.grab_cursor(true);
+            return;
+        }
+        let Some(hit) = self.target else { return };
+
+        match button {
+            MouseButton::Left => {
+                self.gpu.world.set_block(&self.gpu.device, hit.block_pos, AIR);
+                self.refresh_title();
+            }
+            MouseButton::Right => {
+                // Clicking an interactive block/machine (without holding LShift) opens its UI window.
+                // Holding LShift allows placing cables/blocks directly onto an interactive block face.
+                if !self.camera_ctrl.down_held()
+                    && self.gpu.world.energy.is_interactive(hit.block_pos)
+                {
+                    if let Some(status) = self.gpu.world.energy.status(hit.block_pos) {
+                        log::info!("[Machine] {}", status);
+                    }
+                    self.open_ui(UiScreen::Machine(hit.block_pos));
+                    return;
+                }
+
+                // Place the block or use tool (`LIGHTER`) from the selected hotbar slot.
+                if let Some(stack) = self.inventory.selected_stack() {
+                    let hit_id = self.gpu.world.block(hit.block_pos);
+
+                    // Lighter (Flint & Steel): ignites TNT into PrimedTNT or places Fire on the face.
+                    if stack.id == LIGHTER {
+                        if hit_id == TNT {
+                            self.gpu
+                                .world
+                                .ignite_tnt_at(&self.gpu.device, hit.block_pos);
+                        } else {
+                            let fire_pos = hit.block_pos + hit.face_normal;
+                            let dest_id = self.gpu.world.block(fire_pos);
+                            if dest_id == AIR {
+                                self.gpu.world.set_block(&self.gpu.device, fire_pos, FIRE);
+                            }
+                        }
+                        self.refresh_title();
+                        return;
+                    }
+
+                    if is_placeable(stack.id) {
+                        let pos = hit.block_pos + hit.face_normal;
+                        let can_occupy = is_fluid(stack.id)
+                            || stack.id == FIRE
+                            || !self.player.intersects_block(pos);
+                        if can_occupy && self.gpu.world.set_block(&self.gpu.device, pos, stack.id) {
+                            self.inventory.take_one_selected();
+                            self.refresh_title();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── Per-frame update ──────────────────────────────────────────────────
+
+    fn update(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame);
+        self.last_frame = now;
+        // Cap dt to prevent spiral-of-death after alt-tab / breakpoints.
+        let dt_secs = dt.as_secs_f32().min(0.1);
+        self.last_dt_secs = dt_secs;
+
+        // Advance Day/Night cycle.
+        self.sky.update(dt_secs);
+
+        // Fixed 20 TPS simulation tick (energy network, fluids, fire, and TNT detonations).
+        self.tick_accum += dt_secs;
+        let mut ticked = false;
+        while self.tick_accum >= TICK_DT {
+            let impulse = self
+                .gpu
+                .world
+                .tick(&self.gpu.device, self.player.center());
+            if impulse != Vec3::ZERO {
+                self.player.apply_impulse(impulse);
+            }
+            self.tick_accum -= TICK_DT;
+            ticked = true;
+        }
+
+        if !self.gpu.ui.is_open() {
+            self.camera_ctrl.update_look(&mut self.camera);
+        }
+        self.player.update(dt_secs, &mut self.camera_ctrl, &self.camera, &self.gpu.world);
+        self.camera.position = self.player.eye_position();
+
+        // Update item drops & PrimedTNT physics and rebuild dynamic mesh.
+        let world = &mut self.gpu.world;
+        let mut drops = std::mem::replace(&mut world.drops, crate::voxel::drops::Drops::new());
+        drops.update(dt_secs, world, self.player.center(), &mut self.inventory);
+        world.drops = drops;
+
+        let mut explosions = std::mem::replace(
+            &mut world.explosions,
+            crate::sim::explosions::ExplosionSystem::new(),
+        );
+        explosions.update_physics(dt_secs, |p| world.block(p));
+        world.explosions = explosions;
+
+        world.update_drops_mesh(&self.gpu.device);
+
+        // Block under the crosshair (tests thin cable sub-blocks accurately).
+        let prev_target = self.target.map(|h| h.block_pos);
+        let world_ref = &self.gpu.world;
+        self.target = raycast_blocks(self.camera.position, self.camera.forward(), REACH, |p| {
+            world_ref.block(p)
+        });
+        let cur_target = self.target.map(|h| h.block_pos);
+        self.gpu.overlay.update_wire(
+            &self.gpu.queue,
+            self.target.map(|h| (h.bounds_min, h.bounds_max)),
+        );
+
+        let one_sec_elapsed = self.fps_counter.tick(dt).is_some();
+        if one_sec_elapsed {
+            self.refresh_memory_stats();
+        }
+
+        if cur_target != prev_target {
+            if let Some(pos) = cur_target {
+                if let Some(status) = self.gpu.world.energy.status(pos) {
+                    log::info!("[Inspect] {}", status);
+                }
+            }
+            self.refresh_title();
+        } else if one_sec_elapsed || ticked {
+            self.refresh_title();
+        }
+    }
+
+    // ── Render ────────────────────────────────────────────────────────────
+
+    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Check whether the camera eye is submerged in a Water block.
+        let eye_cell = self.camera.position.floor().as_ivec3();
+        let is_underwater = self.gpu.world.block(eye_cell) == WATER;
+
+        // Upload camera + dynamic sun + underwater uniform.
+        let uniform = CameraUniform::from_camera_and_sky(&self.camera, &self.sky, is_underwater);
+        self.gpu.queue.write_buffer(&self.gpu.camera_buffer, 0, uniform.as_bytes());
+        let clear_color = self.sky.clear_color();
+
+        let output = self.gpu.surface.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self.gpu.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("render_encoder") },
+        );
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("main_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.gpu.depth_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            // 1. Sky pass: renders sky dome gradient + 3D Sun & Moon Billboard Quads (15 vertices)
+            pass.set_pipeline(&self.gpu.sky_pipeline);
+            pass.set_bind_group(0, &self.gpu.camera_bind_group, &[]);
+            pass.draw(0..15, 0..1);
+
+            // 2. Opaque geometry pass (terrain, machines, cables, drops, primed TNT)
+            pass.set_pipeline(&self.gpu.render_pipeline);
+            pass.set_bind_group(0, &self.gpu.camera_bind_group, &[]);
+            self.gpu.world.draw_opaque(&mut pass);
+
+            // 3. Translucent geometry pass (alpha-blended water & fire, depth_write=false, cull=None)
+            pass.set_pipeline(&self.gpu.translucent_pipeline);
+            pass.set_bind_group(0, &self.gpu.camera_bind_group, &[]);
+            self.gpu.world.draw_translucent(&mut pass);
+
+            // 4. Wireframe block highlight & crosshair
+            self.gpu.overlay.draw(&mut pass);
+        }
+
+        // Render immediate-mode UI (F3 debug overlay + HUD hotbar + open inventory/machine windows).
+        let scale_factor = self.window.scale_factor() as f32;
+        let width = self.gpu.config.width;
+        let height = self.gpu.config.height;
+
+        let debug_info = if self.gpu.ui.debug_open {
+            let (energy_nets, machines_count, cables_count) =
+                self.gpu.world.energy.network_stats();
+            let targeted_block = self.target.map(|h| (h.block_pos, self.gpu.world.block(h.block_pos)));
+            Some(DebugInfo {
+                fps: self.fps_counter.last_fps,
+                frame_time_ms: self.last_dt_secs * 1000.0,
+                used_process_mb: self.used_process_mb,
+                total_system_mb: self.total_system_mb,
+                mem_percent: self.mem_percent,
+                player_pos: self.player.position(),
+                yaw_deg: self.camera.yaw.to_degrees(),
+                pitch_deg: self.camera.pitch.to_degrees(),
+                flying: self.player.is_flying(),
+                day_time: self.sky.day_time,
+                day_phase: self.sky.phase_name(),
+                targeted_block,
+                active_chunks: self.gpu.world.active_chunk_count(),
+                loaded_fluids: self.gpu.world.fluids.loaded_fluid_count(),
+                energy_nets,
+                machines_count,
+                cables_count,
+                primed_tnt: self.gpu.world.explosions.primed_count(),
+            })
+        } else {
+            None
+        };
+
+        let GpuState { device, queue, world, ui, .. } = &mut self.gpu;
+        let mut energy =
+            std::mem::replace(&mut world.energy, crate::sim::energy_net::EnergyNetwork::new());
+        ui.render(
+            device,
+            queue,
+            &mut encoder,
+            &view,
+            width,
+            height,
+            scale_factor,
+            self.last_dt_secs,
+            &mut self.inventory,
+            &mut energy,
+            debug_info.as_ref(),
+            |p| world.block(p),
+        );
+        world.energy = energy;
+
+        self.gpu.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+        Ok(())
+    }
+}
+
+// ─── WGPU Init ───────────────────────────────────────────────────────────────
+
+async fn init_gpu(window: Arc<Window>) -> GpuState {
+    let size = window.inner_size();
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+
+    // SAFETY: `window` is owned by Engine which lives for the entire
+    // program duration, so the surface lifetime is valid.
+    let surface = instance
+        .create_surface(Arc::clone(&window))
+        .expect("Failed to create wgpu surface");
+
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        })
+        .await
+        .expect("No suitable GPU adapter found");
+
+    log::info!("GPU adapter: {}", adapter.get_info().name);
+
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("voxel_device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+            },
+            None,
+        )
+        .await
+        .expect("Failed to acquire wgpu device");
+
+    let caps = surface.get_capabilities(&adapter);
+    let format = caps
+        .formats
+        .iter()
+        .find(|f| f.is_srgb())
+        .copied()
+        .unwrap_or(caps.formats[0]);
+
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode: wgpu::PresentMode::AutoVsync,
+        alpha_mode: caps.alpha_modes[0],
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
+    };
+    surface.configure(&device, &config);
+
+    // Camera uniform buffer.
+    let cam_placeholder = Camera::new(size.width as f32 / size.height.max(1) as f32);
+    let sky_placeholder = SkyState::new();
+    let cam_uniform = CameraUniform::from_camera_and_sky(&cam_placeholder, &sky_placeholder, false);
+    let camera_buffer = create_camera_buffer(&device, cam_uniform.as_bytes());
+
+    let cam_bgl = create_camera_bind_group_layout(&device);
+    let camera_bind_group = create_camera_bind_group(&device, &cam_bgl, &camera_buffer);
+    let sky_pipeline = create_sky_pipeline(&device, format, &cam_bgl);
+    let render_pipeline = create_render_pipeline(&device, format, &cam_bgl);
+    let translucent_pipeline = create_translucent_pipeline(&device, format, &cam_bgl);
+    let depth_texture =
+        DepthTexture::create(&device, size.width.max(1), size.height.max(1), "depth_texture");
+
+    let world = World::generate(&device);
+    let overlay = OverlayRenderer::new(&device, format, &cam_bgl, size.width.max(1), size.height.max(1));
+    let ui = UiSystem::new(&device, format);
+
+    GpuState {
+        surface,
+        device,
+        queue,
+        config,
+        sky_pipeline,
+        render_pipeline,
+        translucent_pipeline,
+        depth_texture,
+        camera_buffer,
+        camera_bind_group,
+        world,
+        overlay,
+        ui,
+    }
+}
+
+// ─── Public entry point ───────────────────────────────────────────────────────
+
+pub async fn run() {
+    let event_loop = EventLoop::new().expect("Failed to create event loop");
+
+    let window = Arc::new(
+        WindowBuilder::new()
+            .with_title("Voxel Industrial Engine | FPS: 0")
+            .with_inner_size(PhysicalSize::new(1280u32, 720u32))
+            .with_resizable(true)
+            .build(&event_loop)
+            .expect("Failed to create window"),
+    );
+
+    let gpu = init_gpu(Arc::clone(&window)).await;
+
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let pid = sysinfo::get_current_pid().ok();
+
+    let initial_size = window.inner_size();
+    let mut engine = Engine {
+        window,
+        gpu,
+        camera: Camera::new(initial_size.width as f32 / initial_size.height.max(1) as f32),
+        camera_ctrl: CameraController::new(),
+        sky: SkyState::new(),
+        player: Player::new(Vec3::new(0.5, 36.0, 0.5)),
+        inventory: PlayerInventory::new(),
+        target: None,
+        tick_accum: 0.0,
+        last_frame: Instant::now(),
+        last_dt_secs: 1.0 / 60.0,
+        fps_counter: FpsCounter::new(),
+        sys,
+        pid,
+        used_process_mb: 0,
+        total_system_mb: 1,
+        mem_percent: 0.0,
+        cursor_grabbed: false,
+    };
+
+    engine.refresh_memory_stats();
+    engine.refresh_title();
+    log::info!(
+        "Engine ready. Click to capture mouse, E to open inventory, RMB on machine to open UI."
+    );
+
+    // winit 0.29 closure signature: (Event<()>, &EventLoopWindowTarget<()>)
+    // Control flow via elwt.exit() / elwt.set_control_flow().
+    event_loop
+        .run(move |event, elwt| {
+            // Busy-loop: always Poll.
+            elwt.set_control_flow(ControlFlow::Poll);
+
+            match event {
+                // ── Window events ─────────────────────────────────────────
+                Event::WindowEvent { event: wev, window_id }
+                    if window_id == engine.window.id() =>
+                {
+                    match wev {
+                        WindowEvent::CloseRequested => {
+                            log::info!("Close requested.");
+                            elwt.exit();
+                        }
+
+                        WindowEvent::Resized(size) => {
+                            engine.resize(size);
+                        }
+
+                        WindowEvent::ScaleFactorChanged { .. } => {}
+
+                        WindowEvent::Focused(false) => {
+                            engine.camera_ctrl.clear_input();
+                            engine.player.reset_inputs();
+                            engine.grab_cursor(false);
+                        }
+
+                        WindowEvent::CursorMoved { position, .. } => {
+                            let sf = engine.window.scale_factor() as f32;
+                            engine.gpu.ui.on_cursor_moved(position.x, position.y, sf);
+                        }
+
+                        WindowEvent::MouseInput { state, button, .. } => {
+                            engine.handle_mouse_button(button, state);
+                        }
+
+                        WindowEvent::MouseWheel { delta, .. } => {
+                            engine.handle_scroll(&delta);
+                        }
+
+                        WindowEvent::KeyboardInput { event: key_event, .. } => {
+                            engine.handle_key(&key_event);
+                        }
+
+                        _ => {}
+                    }
+                }
+
+                // ── Raw device input (mouse look) ─────────────────────────
+                Event::DeviceEvent { event: dev, .. } => {
+                    if engine.cursor_grabbed && !engine.gpu.ui.is_open() {
+                        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = dev {
+                            engine.camera_ctrl.process_mouse_motion(dx, dy);
+                        }
+                    }
+                }
+
+                // ── Main loop tick (winit 0.29: AboutToWait) ──────────────
+                Event::AboutToWait => {
+                    engine.update();
+
+                    match engine.render() {
+                        Ok(_) => {}
+                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                            let size = engine.window.inner_size();
+                            engine.resize(size);
+                        }
+                        Err(wgpu::SurfaceError::OutOfMemory) => {
+                            log::error!("GPU out of memory — exiting.");
+                            elwt.exit();
+                        }
+                        Err(e) => log::warn!("Frame skip: {:?}", e),
+                    }
+                }
+
+                _ => {}
+            }
+        })
+        .expect("Event loop error");
+}
