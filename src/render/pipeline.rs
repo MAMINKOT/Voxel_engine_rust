@@ -194,26 +194,39 @@ struct VertexOutput {
 fn vs_main(in: VertexInput) -> VertexOutput {
     var pos = in.position;
     var n = in.normal;
+    var v_color = in.color;
+    var ao_and_flags = in.ao_and_flags;
     let time = camera.cam_pos.w;
 
+    let mat_flag = in.ao_and_flags.y;
+    let is_water = abs(mat_flag - 1.0) < 0.25;
+    let is_emissive = abs(mat_flag - 3.0) < 0.25 || abs(mat_flag - 4.0) < 0.25;
+
     // Vertex Wave Displacement for Water (`material_flag == 1.0`) when enabled in Graphics Settings
-    let is_water = abs(in.ao_and_flags.y - 1.0) < 0.25;
-    if is_water && camera.render_params.w > 0.5 && (n.y > 0.5 || fract(pos.y) > 0.02) {
-        let offset_y = sin(pos.x * 1.5 + time * 3.0) * cos(pos.z * 1.5 + time * 2.5) * 0.06;
+    if is_water && camera.render_params.w > 0.5 && in.ao_and_flags.x > 0.5 {
+        let offset_y = sin(pos.x * 1.5 + time * 3.0) * cos(pos.z * 1.5 + time * 2.5) * 0.04;
         pos.y += offset_y;
-        if n.y > 0.5 {
-            let dydx = 1.5 * cos(in.position.x * 1.5 + time * 3.0) * cos(in.position.z * 1.5 + time * 2.5) * 0.06;
-            let dydz = -1.5 * sin(in.position.x * 1.5 + time * 3.0) * sin(in.position.z * 1.5 + time * 2.5) * 0.06;
-            n = normalize(vec3<f32>(-dydx, 1.0, -dydz));
+    }
+
+    if !is_water {
+        // Task 4.1: Procedural vertex color micro-noise (±6% hue/brightness variation from world_pos.xz)
+        if !is_emissive {
+            let noise = fract(sin(dot(pos.xz, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+            v_color = v_color * (0.94 + noise * 0.12);
         }
+        // Task 4.2: Smooth Vertex AO interpolation — convert discrete AO level `0..3` at the vertex
+        // so the rasterizer bilinearly interpolates `ao_factor` smoothly across every quad without hard bands.
+        let ao_level = clamp(u32(round(in.ao_and_flags.x)), 0u, 3u);
+        let ao_lut = vec4<f32>(0.42, 0.67, 0.84, 1.00);
+        ao_and_flags.x = ao_lut[ao_level];
     }
 
     var out: VertexOutput;
     out.clip_position = camera.view_proj * vec4<f32>(pos, 1.0);
     out.normal        = n;
-    out.color         = in.color;
+    out.color         = v_color;
     out.light         = in.light;
-    out.ao_and_flags  = in.ao_and_flags;
+    out.ao_and_flags  = ao_and_flags;
     out.world_pos     = pos;
     return out;
 }
@@ -271,7 +284,8 @@ fn sample_sun_shadow(world_pos: vec3<f32>, normal: vec3<f32>, screen_xy: vec2<f3
         return 1.0; // Shadows Off
     }
 
-    let light_clip = camera.light_view_proj * vec4<f32>(world_pos + normal * 0.04, 1.0);
+    // Task 2.3: 16-Point Poisson Disk PCF with `normal_bias = 0.02`
+    let light_clip = camera.light_view_proj * vec4<f32>(world_pos + normal * 0.02, 1.0);
     let proj = light_clip.xyz / light_clip.w;
     let uv = vec2<f32>(proj.x * 0.5 + 0.5, 0.5 - proj.y * 0.5);
 
@@ -280,7 +294,7 @@ fn sample_sun_shadow(world_pos: vec3<f32>, normal: vec3<f32>, screen_xy: vec2<f3
         return 1.0;
     }
 
-    let ref_z = proj.z - 0.0016;
+    let ref_z = proj.z - 0.0012;
     let texel = 1.0 / 2048.0;
     var vis = 0.0;
 
@@ -347,10 +361,8 @@ fn shade_voxel(in: VertexOutput) -> vec3<f32> {
         face_factor = 0.74;
     }
 
-    // Vertex Corner AO factor `vec4(0.4, 0.65, 0.82, 1.0)[ao_level]`
-    let ao_level = clamp(u32(round(in.ao_and_flags.x)), 0u, 3u);
-    let ao_lut = vec4<f32>(0.40, 0.65, 0.82, 1.00);
-    let ao_factor = ao_lut[ao_level];
+    // Smoothly interpolated Vertex Corner AO factor (computed at vertices in `vs_main`)
+    let ao_factor = clamp(in.ao_and_flags.x, 0.40, 1.00);
 
     // 16-Point Poisson PCF Shadow + Cloud Ground Shadow
     let shadow_vis = sample_sun_shadow(in.world_pos, n, in.clip_position.xy)
@@ -368,14 +380,25 @@ fn shade_voxel(in: VertexOutput) -> vec3<f32> {
     let ambient_floor = vec3<f32>(0.04, 0.06, 0.12);
     let final_light = (max(rgb_light, sun_light) + ambient_floor) * face_factor * ao_factor;
 
-    let clamped_srgb = clamp(in.color, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Task 4.1: Combine vertex color noise with subtle world-space voxel micro-variation
+    // so even large greedy-merged terrain faces have organic non-plastic texture.
+    let mat_flag = in.ao_and_flags.y;
+    let is_emissive = abs(mat_flag - 3.0) < 0.25 || abs(mat_flag - 4.0) < 0.25;
+    var base_srgb = in.color;
+    if !is_emissive {
+        let block_xz = floor(in.world_pos.xz - n.xz * 0.02);
+        let micro_noise = fract(sin(dot(block_xz, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+        let smooth_var = value_noise2d(in.world_pos.xz * 1.35 + vec2<f32>(in.world_pos.y * 0.7));
+        let combined_noise = mix(micro_noise, smooth_var, 0.5);
+        base_srgb = base_srgb * (0.95 + combined_noise * 0.10);
+    }
+
+    let clamped_srgb = clamp(base_srgb, vec3<f32>(0.0), vec3<f32>(1.0));
     let albedo = pow(clamped_srgb, vec3<f32>(2.2));
 
     // Task 2.1: Strict Bloom Isolation — ONLY `MAT_FIRE (3.0)` and `MAT_EMISSIVE (4.0)`
     // (`Lava`, `Torch` flame, `Fire`, and active `ElectricFurnace` / `CoalGenerator` / furnaces)
     // emit HDR radiance > 1.0! Glass, TNT, and terrain are strictly clamped to [0.0, 1.0].
-    let mat_flag = in.ao_and_flags.y;
-    let is_emissive = abs(mat_flag - 3.0) < 0.25 || abs(mat_flag - 4.0) < 0.25;
     if is_emissive {
         return albedo * 3.4;
     }
@@ -405,65 +428,63 @@ fn fs_translucent(in: VertexOutput) -> @location(0) vec4<f32> {
     let mat_flag = in.ao_and_flags.y;
     let is_water = abs(mat_flag - 1.0) < 0.25;
 
-    // ── Task 1.1 & Task 5: Clean Dynamic Water (Zero Underwater Edge Grids) ──
+    // ── Task 1 & Task 3: Crystal-Clear Sloped Water with Beer-Lambert Depth & Wave Specular ──
     if is_water {
-        let n = normalize(in.normal);
+        let base_n = normalize(in.normal);
+        let time = camera.cam_pos.w;
+
+        // Task 3.2: Normal Perturbation from two sinusoids + Blinn-Phong solar specular highlight
+        var wave_norm = base_n;
+        if camera.render_params.w > 0.5 && base_n.y > 0.15 {
+            let wn = normalize(vec3<f32>(
+                sin(in.world_pos.x * 2.0 + time * 3.0) * 0.05,
+                1.0,
+                cos(in.world_pos.z * 2.0 + time * 2.0) * 0.05,
+            ));
+            wave_norm = normalize(vec3<f32>(base_n.x + wn.x, base_n.y * wn.y, base_n.z + wn.z));
+        }
+
         let view_dir = normalize(camera.cam_pos.xyz - in.world_pos);
-        let ndotv = clamp(dot(view_dir, n), 0.0, 1.0);
+        let ndotv = clamp(dot(view_dir, wave_norm), 0.0, 1.0);
         let fresnel = pow(1.0 - ndotv, 3.0);
 
-        // Depth Fade against opaque riverbed in `scene_depth_tex` (NO depth-based foam!)
+        // Task 3.1: Beer-Lambert Law depth absorption (`1.0 - exp(-water_depth * 0.4)`)
         let dims = vec2<i32>(textureDimensions(scene_depth_tex));
         let px = clamp(vec2<i32>(in.clip_position.xy), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
         let bg_depth = textureLoad(scene_depth_tex, px, 0);
-        let bg_dist = linearize_depth(bg_depth);
-        let water_dist = linearize_depth(in.clip_position.z);
-        let depth_diff = max(bg_dist - water_dist, 0.0);
+        let terrain_linear_depth = linearize_depth(bg_depth);
+        let water_linear_depth = linearize_depth(in.clip_position.z);
+        let water_depth = max(terrain_linear_depth - water_linear_depth, 0.0);
 
-        let depth_factor = clamp(depth_diff / 3.5, 0.0, 1.0);
-        let shallow_col = vec3<f32>(0.05, 0.30, 0.54);
-        let deep_col    = vec3<f32>(0.010, 0.048, 0.18);
-        let water_albedo = mix(shallow_col, deep_col, depth_factor);
+        let beer_absorption = 1.0 - exp(-water_depth * 0.4);
+        let shallow_color   = vec3<f32>(0.06, 0.42, 0.58); // Transparent aquamarine shallows
+        let deep_navy_color = vec3<f32>(0.008, 0.032, 0.15); // Deep saturated sapphire/navy
+        let water_color     = mix(shallow_color, deep_navy_color, beer_absorption);
 
-        let shadow_vis = sample_sun_shadow(in.world_pos, n, in.clip_position.xy);
+        let shadow_vis = sample_sun_shadow(in.world_pos, base_n, in.clip_position.xy);
         let sun_l = normalize(camera.sun_dir.xyz);
-        let sun_diff = max(dot(n, sun_l), 0.0) * shadow_vis;
+        let sun_diff = max(dot(wave_norm, sun_l), 0.0) * shadow_vis;
         let light_scale = max(
             in.light.xyz * 0.06667,
             vec3<f32>(in.light.w * 0.06667) * (camera.sun_color.rgb * (0.45 + 0.55 * sun_diff) + vec3<f32>(camera.sun_dir.w) * 0.42)
         ) + vec3<f32>(0.05, 0.07, 0.14);
 
-        var water_col = water_albedo * light_scale;
+        var water_col = water_color * light_scale;
 
-        // Sky reflection via Fresnel (clamped <= 1.0 so water never blooms)
+        // Sky reflection via Fresnel
         let sky_reflect = clamp(camera.sky_color.rgb * 1.05, vec3<f32>(0.0), vec3<f32>(0.95));
-        water_col = mix(water_col, sky_reflect, clamp(fresnel * 0.72, 0.0, 0.85));
+        water_col = mix(water_col, sky_reflect, clamp(fresnel * 0.68, 0.0, 0.82));
 
-        // Task 1.1: Shoreline foam ONLY on the top water plane (`in.normal.y > 0.5`) where it
-        // directly touches a solid dry-land block protruding at `y` or `y + 1` (`shore_mask`)!
-        var foam = 0.0;
-        if in.normal.y > 0.5 {
-            let mask = u32(round(in.ao_and_flags.x));
-            let fx = fract(in.world_pos.x);
-            let fz = fract(in.world_pos.z);
-            if (mask & 1u) != 0u {
-                foam = max(foam, smoothstep(0.90, 0.99, fx));
-            }
-            if (mask & 2u) != 0u {
-                foam = max(foam, 1.0 - smoothstep(0.01, 0.10, fx));
-            }
-            if (mask & 4u) != 0u {
-                foam = max(foam, smoothstep(0.90, 0.99, fz));
-            }
-            if (mask & 8u) != 0u {
-                foam = max(foam, 1.0 - smoothstep(0.01, 0.10, fz));
-            }
-        }
-        let foam_col = clamp(vec3<f32>(0.90, 0.94, 0.98) * max(light_scale, vec3<f32>(0.35)), vec3<f32>(0.0), vec3<f32>(0.95));
-        water_col = clamp(mix(water_col, foam_col, foam * 0.75), vec3<f32>(0.0), vec3<f32>(0.98));
+        // Blinn-Phong solar specular highlight on wave crests
+        let half_vec = normalize(sun_l + view_dir);
+        let spec_angle = max(dot(wave_norm, half_vec), 0.0);
+        let sun_above = clamp(sun_l.y * 4.0, 0.0, 1.0);
+        let specular = pow(spec_angle, 96.0) * 0.65 * shadow_vis * sun_above * camera.sun_color.rgb;
+        water_col = clamp(water_col + specular, vec3<f32>(0.0), vec3<f32>(0.98));
 
-        let base_alpha = mix(0.32, 0.86, depth_factor);
-        let alpha = clamp(max(base_alpha, fresnel * 0.80 + foam * 0.70), 0.28, 0.92);
+        // Task 1.3: Zero white edge lines / zero foam on water block junctions!
+        let base_alpha = mix(0.28, 0.90, beer_absorption);
+        let alpha = clamp(max(base_alpha, fresnel * 0.78), 0.25, 0.94);
         return vec4<f32>(water_col, alpha);
     }
 

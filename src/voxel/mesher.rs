@@ -315,25 +315,76 @@ fn emit_quad(
     }
 }
 
-/// Computes the rendered height `0.125..=1.0` of a fluid voxel from its level `1..=8`.
+/// Computes the smooth corner height in `0.0..=1.0` (`corner_height / 8.0`) for fluid `base`
+/// at the grid vertex `(vx, ly, vz)` by averaging the fluid levels of the 4 columns
+/// `(vx, vz)`, `(vx - 1, vz)`, `(vx, vz - 1)`, `(vx - 1, vz - 1)` meeting at that corner.
 #[inline]
-fn fluid_height<F: Fn(i32, i32, i32) -> BlockId>(
-    x: i32,
-    y: i32,
-    z: i32,
-    raw: BlockId,
+fn fluid_corner_height<F: Fn(i32, i32, i32) -> BlockId>(
+    vx: i32,
+    ly: i32,
+    vz: i32,
+    base: BlockId,
     sample: &F,
 ) -> f32 {
-    let base = base_block_id(raw);
-    if base_block_id(sample(x, y + 1, z)) == base {
-        1.0
+    let offsets = [(0, 0), (-1, 0), (0, -1), (-1, -1)];
+
+    // If any of the 4 columns touching this corner has the same fluid above it (`ly + 1`),
+    // the corner reaches full voxel height `1.0` (`8.0 / 8.0`) to join the upper fluid seamlessly.
+    for (dx, dz) in offsets {
+        let cx = vx + dx;
+        let cz = vz + dz;
+        if base_block_id(sample(cx, ly, cz)) == base
+            && base_block_id(sample(cx, ly + 1, cz)) == base
+        {
+            return 1.0;
+        }
+    }
+
+    let mut sum_levels = 0.0f32;
+    let mut weight = 0.0f32;
+    for (dx, dz) in offsets {
+        let cell = sample(vx + dx, ly, vz + dz);
+        let cell_base = base_block_id(cell);
+        if cell_base == base {
+            sum_levels += fluid_level_from_id(cell) as f32;
+            weight += 1.0;
+        } else if !is_solid_block(cell) {
+            // Air / non-solid neighbor contributes level 0 so flowing streams taper smoothly.
+            weight += 1.0;
+        }
+    }
+
+    if weight > 0.0 {
+        let corner_height = sum_levels / weight;
+        (corner_height / 8.0).clamp(0.05, 1.0)
     } else {
-        let level = fluid_level_from_id(raw);
-        (level as f32) / 8.0
+        1.0
     }
 }
 
-/// Emits a fluid voxel (`Water`, `Lava`, `Oil`) with top height `(level as f32) / 8.0`.
+/// Computes the 4 top corner heights `[h00, h10, h11, h01]` in `0.0..=1.0` for fluid voxel `(lx, ly, lz)`.
+#[inline]
+fn fluid_voxel_corner_heights<F: Fn(i32, i32, i32) -> BlockId>(
+    lx: i32,
+    ly: i32,
+    lz: i32,
+    base: BlockId,
+    sample: &F,
+) -> [f32; 4] {
+    if base_block_id(sample(lx, ly + 1, lz)) == base {
+        [1.0, 1.0, 1.0, 1.0]
+    } else {
+        [
+            fluid_corner_height(lx, ly, lz, base, sample),
+            fluid_corner_height(lx + 1, ly, lz, base, sample),
+            fluid_corner_height(lx + 1, ly, lz + 1, base, sample),
+            fluid_corner_height(lx, ly, lz + 1, base, sample),
+        ]
+    }
+}
+
+/// Emits a smooth corner-interpolated fluid voxel (`Water`, `Lava`, `Oil`) with sloped top surface
+/// (`y_pos = base_y + corner_height / 8.0`) and internal vertical face culling.
 #[allow(clippy::too_many_arguments)]
 fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
     data: &mut MeshData,
@@ -346,30 +397,7 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
     sample: &F,
 ) {
     let base = base_block_id(raw);
-    let h = fluid_height(lx, ly, lz, raw, sample);
     let color = block_face_color(raw, 1);
-
-    let nb_visible = |nx: i32, ny: i32, nz: i32| -> bool {
-        let n_raw = sample(nx, ny, nz);
-        let n_base = base_block_id(n_raw);
-        if is_full_cube(n_raw) || n_base == base {
-            // Never emit internal vertical faces between two adjacent blocks of the same fluid
-            // so underwater riverbeds/pools have zero internal grid lines!
-            return false;
-        }
-        true
-    };
-
-    let show_top = base_block_id(sample(lx, ly + 1, lz)) != base;
-    let show_bottom = {
-        let b_below = sample(lx, ly - 1, lz);
-        !is_full_cube(b_below) && base_block_id(b_below) != base
-    };
-    let show_px = nb_visible(lx + 1, ly, lz);
-    let show_nx = nb_visible(lx - 1, ly, lz);
-    let show_pz = nb_visible(lx, ly, lz + 1);
-    let show_nz = nb_visible(lx, ly, lz - 1);
-
     let mat_flag = if base == WATER {
         MAT_WATER
     } else if base == LAVA {
@@ -378,43 +406,143 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
         MAT_STANDARD
     };
 
-    // Shoreline contact mask (bits 0..3 = +X, -X, +Z, -Z): set ONLY when the top water surface
-    // (`show_top`) directly touches a solid land block at `ly` whose top at `ly + 1` is not submerged.
-    let mut shore_mask: u8 = 0;
-    if base == WATER && show_top {
-        let is_dry_shore = |nx: i32, nz: i32| -> bool {
-            let side = sample(nx, ly, nz);
-            let above_side = sample(nx, ly + 1, nz);
-            is_solid_block(side)
-                && base_block_id(side) != PURPLE_STAINED_GLASS
-                && !is_fluid(above_side)
-        };
-        if is_dry_shore(lx + 1, lz) {
-            shore_mask |= 1;
-        }
-        if is_dry_shore(lx - 1, lz) {
-            shore_mask |= 2;
-        }
-        if is_dry_shore(lx, lz + 1) {
-            shore_mask |= 4;
-        }
-        if is_dry_shore(lx, lz - 1) {
-            shore_mask |= 8;
-        }
-    }
+    let submerged = base_block_id(sample(lx, ly + 1, lz)) == base;
+    let [h00, h10, h11, h01] = fluid_voxel_corner_heights(lx, ly, lz, base, sample);
+    let top_wave_flag = if submerged { 0.0 } else { 1.0 };
 
     let bmin = world_pos.as_vec3();
-    let bmax = bmin + Vec3::new(1.0, h, 1.0);
-    emit_box_with_custom_top_ao(
-        data,
-        bmin,
-        bmax,
-        color,
-        light,
-        shore_mask as f32,
-        mat_flag,
-        [show_px, show_nx, show_top, show_bottom, show_pz, show_nz],
-    );
+    let (x0, y0, z0) = (bmin.x, bmin.y, bmin.z);
+    let (x1, z1) = (x0 + 1.0, z0 + 1.0);
+
+    let push_quad = |data: &mut MeshData,
+                     positions: [[f32; 3]; 4],
+                     normal: [f32; 3],
+                     top_flags: [f32; 4]| {
+        let base_idx = data.vertices.len() as u32;
+        for i in 0..4 {
+            data.vertices.push(Vertex {
+                position: positions[i],
+                normal,
+                color,
+                light,
+                ao_and_flags: [top_flags[i], mat_flag],
+            });
+        }
+        data.indices.extend_from_slice(&[
+            base_idx,
+            base_idx + 1,
+            base_idx + 2,
+            base_idx,
+            base_idx + 2,
+            base_idx + 3,
+        ]);
+    };
+
+    // 1. Top sloped surface (`+Y`): emitted whenever the block above is not the same fluid.
+    if !submerged {
+        let tx = Vec3::new(1.0, ((h10 - h00) + (h11 - h01)) * 0.5, 0.0);
+        let tz = Vec3::new(0.0, ((h01 - h00) + (h11 - h10)) * 0.5, 1.0);
+        let top_n = tz.cross(tx).normalize_or_zero();
+        let normal = if top_n.y > 0.01 {
+            [top_n.x, top_n.y, top_n.z]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        push_quad(
+            data,
+            [
+                [x0, y0 + h01, z1],
+                [x1, y0 + h11, z1],
+                [x1, y0 + h10, z0],
+                [x0, y0 + h00, z0],
+            ],
+            normal,
+            [1.0, 1.0, 1.0, 1.0],
+        );
+    }
+
+    // 2. Bottom surface (`-Y`): only when the block below is neither a full cube nor the same fluid.
+    let b_below = sample(lx, ly - 1, lz);
+    if !is_full_cube(b_below) && base_block_id(b_below) != base {
+        push_quad(
+            data,
+            [
+                [x0, y0, z0],
+                [x1, y0, z0],
+                [x1, y0, z1],
+                [x0, y0, z1],
+            ],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        );
+    }
+
+    // 3. Side faces (`+X`, `-X`, `+Z`, `-Z`) with strict internal face culling:
+    //    - Against a full solid cube: culled.
+    //    - Against another voxel of the same fluid: drawn ONLY if our corner heights exceed the neighbor's
+    //      (from the lower fluid height to the higher fluid height; zero internal walls inside fluid!).
+    //    - Against air / non-fluid: drawn from `y0` (`0.0`) up to our sloped corner heights.
+    let mut emit_side = |nx: i32,
+                         nz: i32,
+                         xa: f32,
+                         za: f32,
+                         xb: f32,
+                         zb: f32,
+                         ha: f32,
+                         hb: f32,
+                         nb_corner_indices: (usize, usize),
+                         normal: [f32; 3]| {
+        let n_raw = sample(nx, ly, nz);
+        if is_full_cube(n_raw) {
+            return;
+        }
+        if base_block_id(n_raw) == base {
+            let nh = fluid_voxel_corner_heights(nx, ly, nz, base, sample);
+            let nha = nh[nb_corner_indices.0];
+            let nhb = nh[nb_corner_indices.1];
+            if ha > nha + 1e-4 || hb > nhb + 1e-4 {
+                let bot_a = y0 + nha.min(ha);
+                let bot_b = y0 + nhb.min(hb);
+                let bot_wave = if base_block_id(sample(nx, ly + 1, nz)) == base {
+                    0.0
+                } else {
+                    1.0
+                };
+                push_quad(
+                    data,
+                    [
+                        [xa, bot_a, za],
+                        [xb, bot_b, zb],
+                        [xb, y0 + hb, zb],
+                        [xa, y0 + ha, za],
+                    ],
+                    normal,
+                    [bot_wave, bot_wave, top_wave_flag, top_wave_flag],
+                );
+            }
+        } else {
+            push_quad(
+                data,
+                [
+                    [xa, y0, za],
+                    [xb, y0, zb],
+                    [xb, y0 + hb, zb],
+                    [xa, y0 + ha, za],
+                ],
+                normal,
+                [0.0, 0.0, top_wave_flag, top_wave_flag],
+            );
+        }
+    };
+
+    // +X side: corners (x1, z1) [h11] -> (x1, z0) [h10]; neighbor (lx+1, lz) corners (0,1)=idx 3 and (0,0)=idx 0
+    emit_side(lx + 1, lz, x1, z1, x1, z0, h11, h10, (3, 0), [1.0, 0.0, 0.0]);
+    // -X side: corners (x0, z0) [h00] -> (x0, z1) [h01]; neighbor (lx-1, lz) corners (1,0)=idx 1 and (1,1)=idx 2
+    emit_side(lx - 1, lz, x0, z0, x0, z1, h00, h01, (1, 2), [-1.0, 0.0, 0.0]);
+    // +Z side: corners (x0, z1) [h01] -> (x1, z1) [h11]; neighbor (lx, lz+1) corners (0,0)=idx 0 and (1,0)=idx 1
+    emit_side(lx, lz + 1, x0, z1, x1, z1, h01, h11, (0, 1), [0.0, 0.0, 1.0]);
+    // -Z side: corners (x1, z0) [h10] -> (x0, z0) [h00]; neighbor (lx, lz-1) corners (1,1)=idx 2 and (0,1)=idx 3
+    emit_side(lx, lz - 1, x1, z0, x0, z0, h10, h00, (2, 3), [0.0, 0.0, -1.0]);
 }
 
 /// Emits a glowing translucent fire sub-block (`[0.12..0.88]` on X/Z, `[0.0..0.82]` on Y).
@@ -691,6 +819,7 @@ fn emit_box_with_custom_top_ao(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voxel::chunk::{with_fluid_level, STONE};
 
     #[test]
     fn corner_ao_follows_voxel_occlusion_table() {
@@ -704,5 +833,59 @@ mod tests {
         assert_eq!(vertex_ao(false, false, true), 2);
         // One side + corner solid -> 1
         assert_eq!(vertex_ao(true, false, true), 1);
+    }
+
+    #[test]
+    fn smooth_water_corner_averaging_and_internal_face_culling() {
+        // Two adjacent water blocks in a stone channel: level 8 at x=0 and level 6 at x=1.
+        let sample = |x: i32, y: i32, z: i32| -> BlockId {
+            if y == 0 || z != 0 || x < 0 || x > 1 {
+                if y <= 1 {
+                    STONE
+                } else {
+                    AIR
+                }
+            } else if y == 1 && x == 0 {
+                with_fluid_level(WATER, 8)
+            } else if y == 1 && x == 1 {
+                with_fluid_level(WATER, 6)
+            } else {
+                AIR
+            }
+        };
+
+        let c0 = fluid_voxel_corner_heights(0, 1, 0, WATER, &sample);
+        let c1 = fluid_voxel_corner_heights(1, 1, 0, WATER, &sample);
+
+        // Shared edge at x = 1 has height (8 + 6) / 2 / 8 = 7.0 / 8.0 = 0.875 on both blocks!
+        assert!((c0[1] - 0.875).abs() < 1e-5);
+        assert!((c0[2] - 0.875).abs() < 1e-5);
+        assert!((c1[0] - 0.875).abs() < 1e-5);
+        assert!((c1[3] - 0.875).abs() < 1e-5);
+
+        // Emit both water voxels and verify ONLY the 2 top sloped quads (8 vertices) are emitted
+        // (zero internal vertical partition between x=0 and x=1!).
+        let mut mesh = MeshData::new();
+        emit_fluid_voxel(
+            &mut mesh,
+            IVec3::new(0, 1, 0),
+            0,
+            1,
+            0,
+            with_fluid_level(WATER, 8),
+            [15.0; 4],
+            &sample,
+        );
+        emit_fluid_voxel(
+            &mut mesh,
+            IVec3::new(1, 1, 0),
+            1,
+            1,
+            0,
+            with_fluid_level(WATER, 6),
+            [15.0; 4],
+            &sample,
+        );
+        assert_eq!(mesh.vertices.len(), 8);
     }
 }

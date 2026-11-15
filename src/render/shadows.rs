@@ -6,10 +6,9 @@ use glam::{Mat4, Vec3, Vec4};
 use crate::render::pipeline::{vertex_buffer_layout, DEPTH_FORMAT};
 
 pub const SHADOW_MAP_SIZE: u32 = 2048;
-pub const SHADOW_ORTHO_RADIUS: f32 = 80.0;
-const SHADOW_DISTANCE: f32 = 140.0;
+pub const SHADOW_HALF_SIZE: f32 = 24.0;
 const SHADOW_Z_NEAR: f32 = 1.0;
-const SHADOW_Z_FAR: f32 = 300.0;
+const SHADOW_Z_FAR: f32 = 280.0;
 
 const SHADOW_SHADER_SRC: &str = r#"
 struct CameraUniform {
@@ -41,8 +40,10 @@ fn vs_shadow(in: VertexInput) -> @builtin(position) vec4<f32> {
 }
 "#;
 
-/// Computes the orthographic `light_projection * light_view` matrix centered on `focus_pos`
-/// with a ~80-block radius, texel-snapped to prevent shadow swimming while moving.
+/// Computes the orthographic `light_projection * light_view` matrix covering a tight
+/// `48.0 x 48.0` meter box (`half_size = 24.0`) around the player camera `focus_pos`
+/// (>42.6 texels/meter at `2048x2048`), texel-snapped via `floor(pos / texel_size) * texel_size`
+/// in light space to eliminate shadow edge shimmering during movement or flight.
 pub fn compute_light_view_proj(focus_pos: Vec3, sun_dir: Vec3) -> Mat4 {
     // Use sun direction when above horizon; clamp minimum elevation so grazing shadows remain stable.
     let raw_dir = if sun_dir.y >= -0.08 {
@@ -50,30 +51,31 @@ pub fn compute_light_view_proj(focus_pos: Vec3, sun_dir: Vec3) -> Mat4 {
     } else {
         -sun_dir
     };
-    let dir = Vec3::new(raw_dir.x, raw_dir.y.max(0.18), raw_dir.z).normalize();
+    let dir = Vec3::new(raw_dir.x, raw_dir.y.max(0.20), raw_dir.z).normalize();
 
-    let center = Vec3::new(focus_pos.x.round(), 20.0, focus_pos.z.round());
-    let eye = center + dir * SHADOW_DISTANCE;
-    let light_view = Mat4::look_at_rh(eye, center, Vec3::Y);
+    let half_size = SHADOW_HALF_SIZE;
+    let texel_size = (half_size * 2.0) / SHADOW_MAP_SIZE as f32;
 
-    // Texel snapping in light view space to eliminate shimmering when the player walks
-    let world_units_per_texel = (SHADOW_ORTHO_RADIUS * 2.0) / SHADOW_MAP_SIZE as f32;
-    let mut origin_ls = light_view * Vec4::new(0.0, 0.0, 0.0, 1.0);
-    origin_ls.x /= origin_ls.w;
-    origin_ls.y /= origin_ls.w;
-    let snap_x = (origin_ls.x / world_units_per_texel).round() * world_units_per_texel - origin_ls.x;
-    let snap_y = (origin_ls.y / world_units_per_texel).round() * world_units_per_texel - origin_ls.y;
+    // Fixed orientation light view matrix looking along `-dir` from origin (never rotates on movement)
+    let light_rot = Mat4::look_at_rh(Vec3::ZERO, -dir, Vec3::Y);
+    let cam_ls = light_rot * Vec4::new(focus_pos.x, focus_pos.y, focus_pos.z, 1.0);
 
-    let r = SHADOW_ORTHO_RADIUS;
+    // Snap light-space camera center to exact shadow map texel grid:
+    // `shadow_cam_pos = floor(shadow_cam_pos / texel_size) * texel_size`
+    let shadow_cam_x = (cam_ls.x / texel_size).floor() * texel_size;
+    let shadow_cam_y = (cam_ls.y / texel_size).floor() * texel_size;
+    let shadow_cam_z = (cam_ls.z / 2.0).floor() * 2.0;
+
+    let half_depth = (SHADOW_Z_FAR - SHADOW_Z_NEAR) * 0.5;
     let light_proj = Mat4::orthographic_rh(
-        -r - snap_x,
-        r - snap_x,
-        -r - snap_y,
-        r - snap_y,
-        SHADOW_Z_NEAR,
-        SHADOW_Z_FAR,
+        shadow_cam_x - half_size,
+        shadow_cam_x + half_size,
+        shadow_cam_y - half_size,
+        shadow_cam_y + half_size,
+        -shadow_cam_z - half_depth,
+        -shadow_cam_z + half_depth,
     );
-    light_proj * light_view
+    light_proj * light_rot
 }
 
 pub struct ShadowRenderer {
