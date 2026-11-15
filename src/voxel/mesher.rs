@@ -1,4 +1,5 @@
-// Greedy meshing for opaque full-cube blocks + multipart sub-block meshing for cables & torches +
+// Greedy meshing for opaque full-cube blocks + Corner Ambient Occlusion (Smooth Lighting)
+// with anisotropic quad flipping + multipart sub-block meshing for cables & torches +
 // proportional-height fluid meshing (`height = (level as f32) / 8.0`) + separate translucent
 // mesh buffer (`Water`, `Fire`, `PurpleStainedGlass`) + RGB/Sun per-vertex `LightData`.
 
@@ -7,12 +8,18 @@ use glam::{IVec3, Vec3};
 use crate::voxel::chunk::{
     base_block_id, block_color, block_face_color, fluid_level_from_id, is_active_block,
     is_energy_connectable, is_fluid, is_full_cube, is_translucent, BlockId, AIR, CABLE, CABLE_MAX,
-    CABLE_MIN, CHUNK_SIZE, FIRE, LAVA, PURPLE_STAINED_GLASS, TORCH,
+    CABLE_MIN, CHUNK_SIZE, FIRE, LAVA, PURPLE_STAINED_GLASS, TORCH, WATER,
 };
 use crate::voxel::light::{
     blue_channel, green_channel, light_to_f32_array, pack_light, red_channel, sun_channel,
     LightData,
 };
+
+/// Material flag stored in `Vertex::ao_and_flags[1]`:
+pub const MAT_STANDARD: f32 = 0.0;
+pub const MAT_WATER: f32 = 1.0;
+pub const MAT_STAINED_GLASS: f32 = 2.0;
+pub const MAT_FIRE: f32 = 3.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -22,6 +29,8 @@ pub struct Vertex {
     pub color: [f32; 3],
     /// `[Red, Green, Blue, Sunlight]`, each in `0.0..=15.0`.
     pub light: [f32; 4],
+    /// `[ao_level (0.0..=3.0), material_flag (0=standard, 1=water, 2=glass, 3=fire)]`.
+    pub ao_and_flags: [f32; 2],
 }
 
 pub struct MeshData {
@@ -46,6 +55,53 @@ pub struct ChunkMeshData {
     pub translucent: MeshData,
 }
 
+/// Computes the classic voxel Corner Ambient Occlusion level (`0..=3`) for one quad vertex
+/// from the 3 neighboring voxels in the plane in front of the face (`side1`, `side2`, `corner`).
+#[inline]
+pub fn vertex_ao(side1_solid: bool, side2_solid: bool, corner_solid: bool) -> u8 {
+    if side1_solid && side2_solid {
+        0
+    } else {
+        3 - (side1_solid as u8 + side2_solid as u8 + corner_solid as u8)
+    }
+}
+
+/// Computes the 4 corner AO values `[ao0, ao1, ao2, ao3]` for the unit face at `q`
+/// (the air cell immediately in front of the face) spanned by tangent axes `(u, v)`.
+#[inline]
+fn compute_face_ao<F: Fn(i32, i32, i32) -> BlockId>(
+    q: [i32; 3],
+    u: usize,
+    v: usize,
+    sample: &F,
+) -> [u8; 4] {
+    let is_occluder = |du: i32, dv: i32| -> bool {
+        let mut pos = q;
+        pos[u] += du;
+        pos[v] += dv;
+        is_full_cube(sample(pos[0], pos[1], pos[2]))
+    };
+
+    // 8 neighbors around `q` in the (u, v) tangent plane
+    let s_neg_u = is_occluder(-1, 0);
+    let s_pos_u = is_occluder(1, 0);
+    let s_neg_v = is_occluder(0, -1);
+    let s_pos_v = is_occluder(0, 1);
+
+    let c_nn = is_occluder(-1, -1);
+    let c_pn = is_occluder(1, -1);
+    let c_pp = is_occluder(1, 1);
+    let c_np = is_occluder(-1, 1);
+
+    // Matches the 4 quad corners emitted in order: (k, j), (k+w, j), (k+w, j+h), (k, j+h)
+    [
+        vertex_ao(s_neg_u, s_neg_v, c_nn),
+        vertex_ao(s_pos_u, s_neg_v, c_pn),
+        vertex_ao(s_pos_u, s_pos_v, c_pp),
+        vertex_ao(s_neg_u, s_pos_v, c_np),
+    ]
+}
+
 /// `sample` and `sample_light` take chunk-local coordinates (may lie in `-1..=32`, i.e. in neighbours).
 pub fn mesh_chunk<F, L>(origin: IVec3, sample: F, sample_light: L) -> ChunkMeshData
 where
@@ -56,9 +112,9 @@ where
     let n = CHUNK_SIZE as i32;
     let mut opaque = MeshData::new();
     let mut translucent = MeshData::new();
-    let mut mask = vec![(AIR, 0u16); size * size];
+    let mut mask = vec![(AIR, 0u16, [3u8; 4]); size * size];
 
-    // ── Pass 1: Greedy meshing of opaque full-cube voxels ─────────────────
+    // ── Pass 1: Greedy meshing of opaque full-cube voxels with Corner AO ──
     for d in 0..3usize {
         let u = (d + 1) % 3;
         let v = (d + 2) % 3;
@@ -89,14 +145,15 @@ where
                                     blue_channel(fl).max(1),
                                 );
                             }
-                            mask[(j * n + k) as usize] = (b, fl);
+                            let ao = compute_face_ao(q, u, v, &sample);
+                            mask[(j * n + k) as usize] = (b, fl, ao);
                         } else {
-                            mask[(j * n + k) as usize] = (AIR, 0);
+                            mask[(j * n + k) as usize] = (AIR, 0, [3; 4]);
                         }
                     }
                 }
 
-                // Greedy merge faces with identical (BlockId, LightData).
+                // Greedy merge faces with identical (BlockId, LightData, CornerAO).
                 for j in 0..size {
                     let mut k = 0;
                     while k < size {
@@ -121,7 +178,7 @@ where
                         }
                         for dy in 0..h {
                             for dx in 0..w {
-                                mask[(j + dy) * size + k + dx] = (AIR, 0);
+                                mask[(j + dy) * size + k + dx] = (AIR, 0, [3; 4]);
                             }
                         }
 
@@ -139,6 +196,7 @@ where
                             h,
                             cell.0,
                             light_to_f32_array(cell.1),
+                            cell.2,
                         );
                         k += w;
                     }
@@ -204,6 +262,7 @@ fn emit_quad(
     h: usize,
     block: BlockId,
     light: [f32; 4],
+    ao: [u8; 4],
 ) {
     let plane = slice + if positive { 1 } else { 0 };
     let (k, j, w, h) = (k as i32, j as i32, w as i32, h as i32);
@@ -213,7 +272,8 @@ fn emit_quad(
     let color = block_face_color(block, d);
 
     let base = data.vertices.len() as u32;
-    for (cu, cv) in [(k, j), (k + w, j), (k + w, j + h), (k, j + h)] {
+    let corners = [(k, j), (k + w, j), (k + w, j + h), (k, j + h)];
+    for (idx, (cu, cv)) in corners.into_iter().enumerate() {
         let mut p = [0i32; 3];
         p[d] = plane;
         p[u] = cu;
@@ -227,15 +287,25 @@ fn emit_quad(
             normal,
             color,
             light,
+            ao_and_flags: [ao[idx] as f32, MAT_STANDARD],
         });
     }
 
-    if positive {
-        data.indices
-            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    } else {
-        data.indices
-            .extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+    // AO Quad Flipping: prevent anisotropic diagonal artifacts when `ao[0] + ao[2] < ao[1] + ao[3]`.
+    let flip = (ao[0] as u16 + ao[2] as u16) < (ao[1] as u16 + ao[3] as u16);
+    match (positive, flip) {
+        (true, false) => data
+            .indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]),
+        (true, true) => data
+            .indices
+            .extend_from_slice(&[base + 1, base + 2, base + 3, base + 1, base + 3, base]),
+        (false, false) => data
+            .indices
+            .extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]),
+        (false, true) => data
+            .indices
+            .extend_from_slice(&[base + 1, base + 3, base + 2, base + 1, base, base + 3]),
     }
 }
 
@@ -297,14 +367,21 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
     let show_pz = nb_visible(lx, ly, lz + 1);
     let show_nz = nb_visible(lx, ly, lz - 1);
 
+    let mat_flag = if base == WATER {
+        MAT_WATER
+    } else {
+        MAT_STANDARD
+    };
+
     let bmin = world_pos.as_vec3();
     let bmax = bmin + Vec3::new(1.0, h, 1.0);
-    emit_box(
+    emit_box_with_flag(
         data,
         bmin,
         bmax,
         color,
         light,
+        mat_flag,
         [show_px, show_nx, show_top, show_bottom, show_pz, show_nz],
     );
 }
@@ -313,12 +390,13 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
 fn emit_fire_voxel(data: &mut MeshData, world_pos: IVec3) {
     let base_pos = world_pos.as_vec3();
     let color = block_face_color(FIRE, 1);
-    emit_box(
+    emit_box_with_flag(
         data,
         base_pos + Vec3::new(0.12, 0.0, 0.12),
         base_pos + Vec3::new(0.88, 0.82, 0.88),
         color,
         [15.0, 8.0, 2.0, 15.0],
+        MAT_FIRE,
         [true, true, true, false, true, true],
     );
 }
@@ -370,12 +448,13 @@ fn emit_stained_glass<F: Fn(i32, i32, i32) -> BlockId>(
         vis(lx, ly, lz - 1),
     ];
     let bmin = world_pos.as_vec3();
-    emit_box(
+    emit_box_with_flag(
         data,
         bmin,
         bmin + Vec3::ONE,
         block_face_color(PURPLE_STAINED_GLASS, 1),
         light,
+        MAT_STAINED_GLASS,
         faces,
     );
 }
@@ -475,13 +554,25 @@ fn emit_cable<F: Fn(i32, i32, i32) -> BlockId>(
     }
 }
 
-/// Emits an axis-aligned box `[min..max]` with selective face flags `[+X, -X, +Y, -Y, +Z, -Z]`.
 fn emit_box(
     data: &mut MeshData,
     min: Vec3,
     max: Vec3,
     color: [f32; 3],
     light: [f32; 4],
+    faces: [bool; 6],
+) {
+    emit_box_with_flag(data, min, max, color, light, MAT_STANDARD, faces);
+}
+
+/// Emits an axis-aligned box `[min..max]` with selective face flags `[+X, -X, +Y, -Y, +Z, -Z]`.
+fn emit_box_with_flag(
+    data: &mut MeshData,
+    min: Vec3,
+    max: Vec3,
+    color: [f32; 3],
+    light: [f32; 4],
+    mat_flag: f32,
     faces: [bool; 6],
 ) {
     let (x0, y0, z0) = (min.x, min.y, min.z);
@@ -537,9 +628,29 @@ fn emit_box(
                 normal,
                 color,
                 light,
+                ao_and_flags: [3.0, mat_flag],
             });
         }
         data.indices
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corner_ao_follows_voxel_occlusion_table() {
+        // Both sides solid -> full occlusion (0) regardless of corner
+        assert_eq!(vertex_ao(true, true, false), 0);
+        assert_eq!(vertex_ao(true, true, true), 0);
+        // No neighbors solid -> full brightness (3)
+        assert_eq!(vertex_ao(false, false, false), 3);
+        // One side or corner solid -> 2
+        assert_eq!(vertex_ao(true, false, false), 2);
+        assert_eq!(vertex_ao(false, false, true), 2);
+        // One side + corner solid -> 1
+        assert_eq!(vertex_ao(true, false, true), 1);
     }
 }

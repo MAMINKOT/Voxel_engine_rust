@@ -71,14 +71,18 @@ pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
     /// Inverse of the rotational view-projection matrix (for sky ray direction reconstruction).
     pub inv_view_proj: [[f32; 4]; 4],
+    /// Column-major 4×4 orthographic directional light view-projection matrix (`2048x2048` shadow map).
+    pub light_view_proj: [[f32; 4]; 4],
     /// `xyz` = normalized direction towards the sun, `w` = ambient light strength.
     pub sun_dir: [f32; 4],
     /// `rgb` = directional sun light color, `w` = `1.0` if camera is underwater else `0.0`.
     pub sun_color: [f32; 4],
     /// `rgb` = linear sky color, `w` = sunrise/sunset horizon factor (`0.0..=1.0`).
     pub sky_color: [f32; 4],
-    /// `xyz` = camera world-space position (used to orbit 3D Sun/Moon billboards at `camera.pos ± sun_dir * 400.0`).
+    /// `xyz` = camera world-space position, `w` = elapsed animation time in seconds (water waves).
     pub cam_pos: [f32; 4],
+    /// `xy` = Sun screen-space UV (`0..1`), `z` = Volumetric God Rays visibility, `w` = aspect ratio.
+    pub sun_screen: [f32; 4],
 }
 
 impl CameraUniform {
@@ -86,17 +90,39 @@ impl CameraUniform {
         camera: &Camera,
         sky: &crate::render::sky::SkyState,
         is_underwater: bool,
+        elapsed_secs: f32,
     ) -> Self {
         let dir = sky.sun_direction();
         let col = sky.sun_color();
         let sky_rgb = sky.sky_linear_rgb();
         let horizon = sky.sun_horizon_factor();
+        let vp = camera.view_proj();
+        let light_vp = crate::render::shadows::compute_light_view_proj(camera.position, dir);
+
+        // Project Sun into Screen UV [0.0..1.0] for Screen-Space Volumetric God Rays
+        let sun_world = camera.position + dir * 400.0;
+        let clip = vp * glam::Vec4::new(sun_world.x, sun_world.y, sun_world.z, 1.0);
+        let (sun_u, sun_v, godray_vis) = if clip.w > 0.0 && dir.y > -0.18 {
+            let ndc_x = clip.x / clip.w;
+            let ndc_y = clip.y / clip.w;
+            let u = ndc_x * 0.5 + 0.5;
+            let v = 0.5 - ndc_y * 0.5;
+            let in_fov = (1.35 - ndc_x.abs().max(ndc_y.abs())).clamp(0.0, 1.0);
+            let elev_vis = ((dir.y + 0.18) / 0.35).clamp(0.0, 1.0);
+            let uw_mult = if is_underwater { 0.25 } else { 1.0 };
+            let vis = in_fov * elev_vis * (0.65 + 0.75 * horizon) * uw_mult;
+            (u, v, vis)
+        } else {
+            (0.5, 0.5, 0.0)
+        };
+
         // Rotational view matrix (origin at 0) so sky rays are translation-invariant.
         let rot_view = Mat4::look_to_rh(Vec3::ZERO, camera.forward(), Vec3::Y);
         let rot_vp = camera.projection_matrix() * rot_view;
         Self {
-            view_proj: camera.view_proj().to_cols_array_2d(),
+            view_proj: vp.to_cols_array_2d(),
             inv_view_proj: rot_vp.inverse().to_cols_array_2d(),
+            light_view_proj: light_vp.to_cols_array_2d(),
             sun_dir: [dir.x, dir.y, dir.z, sky.ambient_strength()],
             sun_color: [
                 col[0],
@@ -105,7 +131,13 @@ impl CameraUniform {
                 if is_underwater { 1.0 } else { 0.0 },
             ],
             sky_color: [sky_rgb[0], sky_rgb[1], sky_rgb[2], horizon],
-            cam_pos: [camera.position.x, camera.position.y, camera.position.z, 1.0],
+            cam_pos: [
+                camera.position.x,
+                camera.position.y,
+                camera.position.z,
+                elapsed_secs,
+            ],
+            sun_screen: [sun_u, sun_v, godray_vis, camera.aspect],
         }
     }
 

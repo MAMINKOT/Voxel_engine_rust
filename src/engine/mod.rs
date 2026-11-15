@@ -27,8 +27,11 @@ use crate::player::Player;
 use crate::render::overlay::OverlayRenderer;
 use crate::render::pipeline::{
     create_camera_bind_group, create_camera_bind_group_layout, create_camera_buffer,
-    create_render_pipeline, create_sky_pipeline, create_translucent_pipeline, DepthTexture,
+    create_render_pipeline, create_scene_env_bind_group, create_scene_env_bind_group_layout,
+    create_sky_pipeline, create_translucent_pipeline, DepthTexture,
 };
+use crate::render::postprocess::PostProcessor;
+use crate::render::shadows::ShadowRenderer;
 use crate::render::sky::SkyState;
 use crate::render::ui::{UiScreen, UiSystem};
 use crate::sim::energy_net::TICK_DT;
@@ -77,6 +80,11 @@ struct GpuState {
     render_pipeline: wgpu::RenderPipeline,
     translucent_pipeline: wgpu::RenderPipeline,
     depth_texture: DepthTexture,
+    scene_depth_copy: DepthTexture,
+    shadows: ShadowRenderer,
+    scene_env_bgl: wgpu::BindGroupLayout,
+    scene_env_bg: wgpu::BindGroup,
+    postprocess: PostProcessor,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     world: World,
@@ -99,6 +107,7 @@ struct Engine {
     inventory: PlayerInventory,
     target: Option<RaycastHit>,
     tick_accum: f32,
+    elapsed_secs: f32,
     last_frame: Instant,
     last_dt_secs: f32,
     fps_counter: FpsCounter,
@@ -160,6 +169,26 @@ impl Engine {
             new_size.width,
             new_size.height,
             "depth_texture",
+        );
+        self.gpu.scene_depth_copy = DepthTexture::create(
+            &self.gpu.device,
+            new_size.width,
+            new_size.height,
+            "scene_depth_copy",
+        );
+        self.gpu.scene_env_bg = create_scene_env_bind_group(
+            &self.gpu.device,
+            &self.gpu.scene_env_bgl,
+            &self.gpu.shadows.view,
+            &self.gpu.shadows.sampler,
+            &self.gpu.scene_depth_copy.view,
+        );
+        self.gpu.postprocess.resize(
+            &self.gpu.device,
+            new_size.width,
+            new_size.height,
+            &self.gpu.scene_depth_copy,
+            &self.gpu.camera_buffer,
         );
         self.camera.set_aspect(new_size.width, new_size.height);
         self.gpu.overlay.resize(&self.gpu.queue, new_size.width, new_size.height);
@@ -353,6 +382,7 @@ impl Engine {
         // Cap dt to prevent spiral-of-death after alt-tab / breakpoints.
         let dt_secs = dt.as_secs_f32().min(0.1);
         self.last_dt_secs = dt_secs;
+        self.elapsed_secs = (self.elapsed_secs + dt_secs) % 100_000.0;
 
         // Advance Day/Night cycle.
         self.sky.update(dt_secs);
@@ -429,8 +459,13 @@ impl Engine {
         let eye_cell = self.camera.position.floor().as_ivec3();
         let is_underwater = self.gpu.world.block(eye_cell) == WATER;
 
-        // Upload camera + dynamic sun + underwater uniform.
-        let uniform = CameraUniform::from_camera_and_sky(&self.camera, &self.sky, is_underwater);
+        // Upload camera + directional shadow matrix + dynamic sun + water wave time uniform.
+        let uniform = CameraUniform::from_camera_and_sky(
+            &self.camera,
+            &self.sky,
+            is_underwater,
+            self.elapsed_secs,
+        );
         self.gpu.queue.write_buffer(&self.gpu.camera_buffer, 0, uniform.as_bytes());
         let clear_color = self.sky.clear_color();
 
@@ -443,11 +478,33 @@ impl Engine {
             &wgpu::CommandEncoderDescriptor { label: Some("render_encoder") },
         );
 
+        // 1. Directional Shadow Pass (`2048x2048` Depth32Float)
+        {
+            let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sun_shadow_pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.gpu.shadows.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            shadow_pass.set_pipeline(&self.gpu.shadows.pipeline);
+            shadow_pass.set_bind_group(0, &self.gpu.camera_bind_group, &[]);
+            self.gpu.world.draw_opaque(&mut shadow_pass);
+        }
+
+        // 2. HDR Sky + Opaque Voxel Pass (`Rgba16Float` + `depth_texture`)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main_pass"),
+                label: Some("hdr_opaque_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.gpu.postprocess.hdr_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear_color),
@@ -466,23 +523,91 @@ impl Engine {
                 timestamp_writes: None,
             });
 
-            // 1. Sky pass: renders sky dome gradient + 3D Sun & Moon Billboard Quads (15 vertices)
+            // 2a. Sky dome gradient + 3D Sun & Moon Billboard Quads (15 vertices)
             pass.set_pipeline(&self.gpu.sky_pipeline);
             pass.set_bind_group(0, &self.gpu.camera_bind_group, &[]);
             pass.draw(0..15, 0..1);
 
-            // 2. Opaque geometry pass (terrain, machines, cables, drops, primed TNT)
+            // 2b. Opaque geometry pass (terrain, machines, cables, torches, drops, primed TNT)
             pass.set_pipeline(&self.gpu.render_pipeline);
             pass.set_bind_group(0, &self.gpu.camera_bind_group, &[]);
+            pass.set_bind_group(1, &self.gpu.scene_env_bg, &[]);
             self.gpu.world.draw_opaque(&mut pass);
+        }
 
-            // 3. Translucent geometry pass (alpha-blended water & fire, depth_write=false, cull=None)
+        // 3. Copy opaque depth buffer to `scene_depth_copy` for Water Depth Fade & God Rays
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.gpu.depth_texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &self.gpu.scene_depth_copy.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.gpu.config.width.max(1),
+                height: self.gpu.config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // 4. HDR Translucent Pass (Water with Waves/Fresnel/Depth Fade, Fire, Stained Glass) + Wireframe
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hdr_translucent_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.gpu.postprocess.hdr_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.gpu.depth_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
             pass.set_pipeline(&self.gpu.translucent_pipeline);
             pass.set_bind_group(0, &self.gpu.camera_bind_group, &[]);
+            pass.set_bind_group(1, &self.gpu.scene_env_bg, &[]);
             self.gpu.world.draw_translucent(&mut pass);
 
-            // 4. Wireframe block highlight & crosshair
-            self.gpu.overlay.draw(&mut pass);
+            self.gpu.overlay.draw_wire(&mut pass);
+        }
+
+        // 5. Post-Processing: 1/4-Res Kawase Bloom + 32-step Volumetric God Rays + ACES Tonemap + Vignette
+        self.gpu.postprocess.execute(&mut encoder, &view);
+
+        // 6. 2D Crosshair on top of the tonemapped swapchain surface
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("crosshair_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            self.gpu.overlay.draw_crosshair(&mut pass);
         }
 
         // Render immediate-mode UI (F3 debug overlay + HUD hotbar + open inventory/machine windows).
@@ -605,16 +730,43 @@ async fn init_gpu(window: Arc<Window>) -> GpuState {
     // Camera uniform buffer.
     let cam_placeholder = Camera::new(size.width as f32 / size.height.max(1) as f32);
     let sky_placeholder = SkyState::new();
-    let cam_uniform = CameraUniform::from_camera_and_sky(&cam_placeholder, &sky_placeholder, false);
+    let cam_uniform =
+        CameraUniform::from_camera_and_sky(&cam_placeholder, &sky_placeholder, false, 0.0);
     let camera_buffer = create_camera_buffer(&device, cam_uniform.as_bytes());
 
     let cam_bgl = create_camera_bind_group_layout(&device);
     let camera_bind_group = create_camera_bind_group(&device, &cam_bgl, &camera_buffer);
-    let sky_pipeline = create_sky_pipeline(&device, format, &cam_bgl);
-    let render_pipeline = create_render_pipeline(&device, format, &cam_bgl);
-    let translucent_pipeline = create_translucent_pipeline(&device, format, &cam_bgl);
+
+    let shadows = ShadowRenderer::new(&device, &cam_bgl);
     let depth_texture =
         DepthTexture::create(&device, size.width.max(1), size.height.max(1), "depth_texture");
+    let scene_depth_copy = DepthTexture::create(
+        &device,
+        size.width.max(1),
+        size.height.max(1),
+        "scene_depth_copy",
+    );
+
+    let scene_env_bgl = create_scene_env_bind_group_layout(&device);
+    let scene_env_bg = create_scene_env_bind_group(
+        &device,
+        &scene_env_bgl,
+        &shadows.view,
+        &shadows.sampler,
+        &scene_depth_copy.view,
+    );
+
+    let sky_pipeline = create_sky_pipeline(&device, &cam_bgl);
+    let render_pipeline = create_render_pipeline(&device, &cam_bgl, &scene_env_bgl);
+    let translucent_pipeline = create_translucent_pipeline(&device, &cam_bgl, &scene_env_bgl);
+    let postprocess = PostProcessor::new(
+        &device,
+        format,
+        size.width.max(1),
+        size.height.max(1),
+        &scene_depth_copy,
+        &camera_buffer,
+    );
 
     let world = World::generate(&device);
     let overlay = OverlayRenderer::new(&device, format, &cam_bgl, size.width.max(1), size.height.max(1));
@@ -629,6 +781,11 @@ async fn init_gpu(window: Arc<Window>) -> GpuState {
         render_pipeline,
         translucent_pipeline,
         depth_texture,
+        scene_depth_copy,
+        shadows,
+        scene_env_bgl,
+        scene_env_bg,
+        postprocess,
         camera_buffer,
         camera_bind_group,
         world,
@@ -668,6 +825,7 @@ pub async fn run() {
         inventory: PlayerInventory::new(),
         target: None,
         tick_accum: 0.0,
+        elapsed_secs: 0.0,
         last_frame: Instant::now(),
         last_dt_secs: 1.0 / 60.0,
         fps_counter: FpsCounter::new(),

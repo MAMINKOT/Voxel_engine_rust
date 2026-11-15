@@ -378,6 +378,7 @@ impl ExplosionSystem {
                         normal,
                         color,
                         light: [15.0, 15.0, 15.0, 15.0],
+                        ao_and_flags: [3.0, 0.0],
                     });
                 }
                 indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);

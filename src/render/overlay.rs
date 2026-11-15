@@ -9,14 +9,18 @@ use glam::Vec3;
 use wgpu::util::DeviceExt;
 
 use crate::render::pipeline::DEPTH_FORMAT;
+use crate::render::postprocess::HDR_FORMAT;
 
 const WIRE_SHADER: &str = r#"
 struct CameraUniform {
-    view_proj:     mat4x4<f32>,
-    inv_view_proj: mat4x4<f32>,
-    sun_dir:       vec4<f32>,
-    sun_color:     vec4<f32>,
-    sky_color:     vec4<f32>,
+    view_proj:       mat4x4<f32>,
+    inv_view_proj:   mat4x4<f32>,
+    light_view_proj: mat4x4<f32>,
+    sun_dir:         vec4<f32>,
+    sun_color:       vec4<f32>,
+    sky_color:       vec4<f32>,
+    cam_pos:         vec4<f32>,
+    sun_screen:      vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
@@ -132,7 +136,7 @@ impl OverlayRenderer {
                 module: &wire_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
+                    format: HDR_FORMAT,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -199,13 +203,7 @@ impl OverlayRenderer {
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
@@ -234,13 +232,18 @@ impl OverlayRenderer {
         );
     }
 
+    /// Draws the 3D wireframe box around the targeted voxel inside the HDR pass.
     /// Expects the camera bind group to be set at slot 0 already.
-    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+    pub fn draw_wire<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         if self.wire_visible {
             pass.set_pipeline(&self.wire_pipeline);
             pass.set_vertex_buffer(0, self.wire_buffer.slice(..));
             pass.draw(0..WIRE_VERTICES as u32, 0..1);
         }
+    }
+
+    /// Draws the inverted-color 2D crosshair onto the final tonemapped swapchain surface.
+    pub fn draw_crosshair<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         pass.set_pipeline(&self.crosshair_pipeline);
         pass.set_vertex_buffer(0, self.crosshair_buffer.slice(..));
         pass.draw(0..CROSSHAIR_VERTICES as u32, 0..1);
