@@ -1,5 +1,6 @@
-// Render pipeline module (Step 9: HDR `Rgba16Float`, Vertex Corner AO, 3x3 PCF Directional
-// Shadows, and Dynamic Water with Vertex Waves, Fresnel Reflection, Depth Fade & Shore Foam).
+// Render pipeline module (Step 10: Sharp 1:1 HDR `Rgba16Float`, Vertex Corner AO,
+// 16-Point Poisson Disk PCF Shadows with Dither & 10% Cascade Blend, Cloud Ground Shadows,
+// Strict Emissive-Only Bloom Isolation, and Clean Dynamic Water without Underwater Edge Grids).
 
 use wgpu::util::DeviceExt;
 
@@ -17,6 +18,7 @@ struct CameraUniform {
     sky_color:       vec4<f32>,
     cam_pos:         vec4<f32>,
     sun_screen:      vec4<f32>,
+    render_params:   vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -91,24 +93,24 @@ fn vs_sky(@builtin(vertex_index) idx: u32) -> SkyVarying {
 fn fs_sky(in: SkyVarying) -> @location(0) vec4<f32> {
     let horizon_factor = camera.sky_color.w;
 
-    // 1. 3D Sun Billboard Quad (`quad_id == 1`) — HDR emission > 1.0 for natural solar Bloom
+    // 1. 3D Sun Billboard Quad (`quad_id == 1`) — clamped <= 1.0 so sky does not wash out Bloom
     if in.quad_id == 1u {
         let r = length(in.uv);
         let box_d = max(abs(in.uv.x), abs(in.uv.y));
         if r > 1.0 {
             discard;
         }
-        let core_zenith  = vec3<f32>(4.20, 4.00, 3.40);
-        let core_horizon = vec3<f32>(3.80, 0.85, 0.18);
-        let glow_zenith  = vec3<f32>(1.80, 1.35, 0.50);
-        let glow_horizon = vec3<f32>(1.75, 0.28, 0.04);
+        let core_zenith  = vec3<f32>(1.00, 0.99, 0.92);
+        let core_horizon = vec3<f32>(1.00, 0.28, 0.06);
+        let glow_zenith  = vec3<f32>(1.00, 0.82, 0.35);
+        let glow_horizon = vec3<f32>(0.92, 0.16, 0.03);
 
         let core_col = mix(core_zenith, core_horizon, horizon_factor);
         let glow_col = mix(glow_zenith, glow_horizon, horizon_factor);
 
         let core_mask = 1.0 - smoothstep(0.36, 0.48, box_d);
         let corona = pow(clamp(1.0 - r, 0.0, 1.0), 1.8);
-        let col = mix(glow_col, core_col, core_mask);
+        let col = clamp(mix(glow_col, core_col, core_mask), vec3<f32>(0.0), vec3<f32>(1.0));
         let alpha = clamp(core_mask + corona * 0.85, 0.0, 1.0);
         return vec4<f32>(col, alpha);
     }
@@ -120,11 +122,11 @@ fn fs_sky(in: SkyVarying) -> @location(0) vec4<f32> {
         if r > 1.0 {
             discard;
         }
-        let core_col = vec3<f32>(1.65, 1.75, 1.95);
-        let halo_col = vec3<f32>(0.55, 0.72, 1.10);
+        let core_col = vec3<f32>(0.92, 0.96, 1.00);
+        let halo_col = vec3<f32>(0.48, 0.64, 0.95);
         let core_mask = 1.0 - smoothstep(0.38, 0.46, box_d);
         let halo = pow(clamp(1.0 - r, 0.0, 1.0), 2.2);
-        let col = mix(halo_col, core_col, core_mask);
+        let col = clamp(mix(halo_col, core_col, core_mask), vec3<f32>(0.0), vec3<f32>(1.0));
         let alpha = clamp(core_mask * 0.95 + halo * 0.55, 0.0, 1.0);
         return vec4<f32>(col, alpha);
     }
@@ -133,12 +135,12 @@ fn fs_sky(in: SkyVarying) -> @location(0) vec4<f32> {
     let world_h = camera.inv_view_proj * vec4<f32>(in.uv, 1.0, 1.0);
     let ray_dir = normalize(world_h.xyz / world_h.w);
     let horizon_mix = clamp(ray_dir.y * 0.5 + 0.5, 0.0, 1.0);
-    var col = camera.sky_color.rgb * mix(1.18, 0.86, horizon_mix);
+    var col = camera.sky_color.rgb * mix(1.14, 0.86, horizon_mix);
 
     let sun_direction = normalize(camera.sun_dir.xyz);
     let sun_dot = max(dot(ray_dir, sun_direction), 0.0);
-    let sunset_haze = pow(sun_dot, 6.0) * horizon_factor * 0.45;
-    col = col + vec3<f32>(1.15, 0.30, 0.06) * sunset_haze;
+    let sunset_haze = pow(sun_dot, 6.0) * horizon_factor * 0.35;
+    col = clamp(col + vec3<f32>(0.95, 0.25, 0.05) * sunset_haze, vec3<f32>(0.0), vec3<f32>(1.0));
 
     var final_color = vec4<f32>(col, 1.0);
     if camera.sun_color.w > 0.5 {
@@ -160,6 +162,7 @@ struct CameraUniform {
     sky_color:       vec4<f32>,
     cam_pos:         vec4<f32>, // xyz = cam_pos, w = time in seconds
     sun_screen:      vec4<f32>,
+    render_params:   vec4<f32>, // x = shadow_quality (0/1/2), y = bloom_strength, z = clouds_enabled, w = water_waves
 };
 
 @group(0) @binding(0)
@@ -175,7 +178,7 @@ struct VertexInput {
     @location(1) normal:       vec3<f32>,
     @location(2) color:        vec3<f32>,
     @location(3) light:        vec4<f32>, // [R, G, B, Sun] in 0.0..=15.0
-    @location(4) ao_and_flags: vec2<f32>, // [ao_level (0..3), material_flag (0=std, 1=water, 2=glass, 3=fire)]
+    @location(4) ao_and_flags: vec2<f32>, // [ao_or_shore_mask, mat_flag (0=std, 1=water, 2=glass, 3=fire, 4=emissive)]
 };
 
 struct VertexOutput {
@@ -193,13 +196,12 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     var n = in.normal;
     let time = camera.cam_pos.w;
 
-    // Task 5.1: Vertex Wave Displacement for Water (`material_flag == 1.0`)
+    // Vertex Wave Displacement for Water (`material_flag == 1.0`) when enabled in Graphics Settings
     let is_water = abs(in.ao_and_flags.y - 1.0) < 0.25;
-    if is_water && (n.y > 0.5 || fract(pos.y) > 0.02) {
+    if is_water && camera.render_params.w > 0.5 && (n.y > 0.5 || fract(pos.y) > 0.02) {
         let offset_y = sin(pos.x * 1.5 + time * 3.0) * cos(pos.z * 1.5 + time * 2.5) * 0.06;
         pos.y += offset_y;
         if n.y > 0.5 {
-            // Analytical normal perturbation from wave slope
             let dydx = 1.5 * cos(in.position.x * 1.5 + time * 3.0) * cos(in.position.z * 1.5 + time * 2.5) * 0.06;
             let dydz = -1.5 * sin(in.position.x * 1.5 + time * 3.0) * sin(in.position.z * 1.5 + time * 2.5) * 0.06;
             n = normalize(vec3<f32>(-dydx, 1.0, -dydz));
@@ -216,40 +218,124 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
-// ── Task 2.3: 3x3 PCF Directional Shadow Sampling ────────────────────────────
-fn sample_sun_shadow(world_pos: vec3<f32>, normal: vec3<f32>) -> f32 {
-    let light_clip = camera.light_view_proj * vec4<f32>(world_pos + normal * 0.035, 1.0);
+// ── Cloud Noise for Soft Moving Ground Shadows (`Y = 128.0`) ──────────────────
+fn hash21(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+fn value_noise2d(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash21(i + vec2<f32>(0.0, 0.0));
+    let b = hash21(i + vec2<f32>(1.0, 0.0));
+    let c = hash21(i + vec2<f32>(0.0, 1.0));
+    let d = hash21(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn cloud_fbm(uv: vec2<f32>) -> f32 {
+    var val = 0.0;
+    val += 0.58 * value_noise2d(uv * 16.0);
+    val += 0.28 * value_noise2d(uv * 32.0 + vec2<f32>(17.3, 9.1));
+    val += 0.14 * value_noise2d(uv * 64.0 + vec2<f32>(43.7, 28.5));
+    return val;
+}
+
+fn sample_cloud_shadow(world_pos: vec3<f32>, sun_l: vec3<f32>) -> f32 {
+    if camera.render_params.z < 0.5 || sun_l.y <= 0.05 {
+        return 1.0;
+    }
+    let time = camera.cam_pos.w;
+    let wind = vec2<f32>(time * 4.5, time * 1.8);
+    let ray_t = max(128.0 - world_pos.y, 0.0) / max(sun_l.y, 0.18);
+    let cloud_xz = world_pos.xz + sun_l.xz * ray_t;
+    let uv = (cloud_xz + wind) * 0.003;
+    let n = cloud_fbm(uv);
+    if n <= 0.55 {
+        return 1.0;
+    }
+    return mix(1.0, 0.72, smoothstep(0.55, 0.72, n));
+}
+
+// ── Task 3: 16-Point Poisson Disk PCF with Rotated Dither & 10% Cascade Blend ──
+fn interleaved_gradient_noise(pixel: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(0.06711056 * pixel.x + 0.00583715 * pixel.y));
+}
+
+fn sample_sun_shadow(world_pos: vec3<f32>, normal: vec3<f32>, screen_xy: vec2<f32>) -> f32 {
+    let quality = camera.render_params.x;
+    if quality < 0.5 {
+        return 1.0; // Shadows Off
+    }
+
+    let light_clip = camera.light_view_proj * vec4<f32>(world_pos + normal * 0.04, 1.0);
     let proj = light_clip.xyz / light_clip.w;
     let uv = vec2<f32>(proj.x * 0.5 + 0.5, 0.5 - proj.y * 0.5);
 
-    if uv.x <= 0.002 || uv.x >= 0.998 || uv.y <= 0.002 || uv.y >= 0.998 || proj.z <= 0.0 || proj.z >= 1.0 {
+    let edge = max(abs(proj.x), abs(proj.y));
+    if edge >= 1.0 || proj.z <= 0.0 || proj.z >= 1.0 {
         return 1.0;
     }
 
+    let ref_z = proj.z - 0.0016;
     let texel = 1.0 / 2048.0;
-    let ref_z = proj.z - 0.0015;
     var vis = 0.0;
-    for (var dy = -1; dy <= 1; dy = dy + 1) {
-        for (var dx = -1; dx <= 1; dx = dx + 1) {
-            let offset = vec2<f32>(f32(dx), f32(dy)) * texel;
-            vis += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + offset, ref_z);
-        }
-    }
-    vis = vis * (1.0 / 9.0);
 
-    // Smooth fade out at the boundary of the 80-block shadow frustum
-    let edge = max(abs(proj.x), abs(proj.y));
-    let fade = smoothstep(0.88, 0.99, edge);
-    return mix(vis, 1.0, fade);
+    if quality < 1.5 {
+        // Low quality: fast 4-tap PCF
+        let s0 = textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2<f32>(-0.75, -0.75) * texel, ref_z);
+        let s1 = textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2<f32>( 0.75, -0.75) * texel, ref_z);
+        let s2 = textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2<f32>(-0.75,  0.75) * texel, ref_z);
+        let s3 = textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2<f32>( 0.75,  0.75) * texel, ref_z);
+        vis = (s0 + s1 + s2 + s3) * 0.25;
+    } else {
+        // High quality: 16-Point Poisson Disk PCF with per-pixel rotated dither
+        var poisson = array<vec2<f32>, 16>(
+            vec2<f32>(-0.94201624, -0.39906216),
+            vec2<f32>( 0.94558609, -0.76890725),
+            vec2<f32>(-0.09418410, -0.92938870),
+            vec2<f32>( 0.34495938,  0.29387760),
+            vec2<f32>(-0.91588581,  0.45771432),
+            vec2<f32>(-0.81544232, -0.87912464),
+            vec2<f32>(-0.38277543,  0.27676845),
+            vec2<f32>( 0.97484398,  0.75648379),
+            vec2<f32>( 0.44323325, -0.97511554),
+            vec2<f32>( 0.53742981, -0.47373420),
+            vec2<f32>(-0.26496911, -0.41893023),
+            vec2<f32>( 0.79197514,  0.19090188),
+            vec2<f32>(-0.24188840,  0.99706507),
+            vec2<f32>(-0.81409955,  0.91437590),
+            vec2<f32>( 0.19984126,  0.78641367),
+            vec2<f32>( 0.14383161, -0.14100790),
+        );
+
+        let angle = interleaved_gradient_noise(screen_xy) * 6.2831853;
+        let s = sin(angle);
+        let c = cos(angle);
+        let spread = texel * 2.1;
+
+        for (var i = 0; i < 16; i = i + 1) {
+            let p = poisson[i];
+            let rotated = vec2<f32>(p.x * c - p.y * s, p.x * s + p.y * c) * spread;
+            vis += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + rotated, ref_z);
+        }
+        vis = vis * (1.0 / 16.0);
+    }
+
+    // Task 3.2: Linearly blend the outer 10% (`0.90..1.00`) of the cascade zone to eliminate seam lines
+    let cascade_blend = clamp((edge - 0.90) / 0.10, 0.0, 1.0);
+    return mix(vis, 1.0, cascade_blend);
 }
 
-// ── Shared RGB + Sunlight + PCF Shadow + Corner AO + HDR Emissive Shading ────
+// ── Shared RGB + Sunlight + Poisson PCF Shadow + Corner AO + Isolated Emissive ──
 fn shade_voxel(in: VertexOutput) -> vec3<f32> {
     let n = normalize(in.normal);
     let sun_l = normalize(camera.sun_dir.xyz);
     let moon_l = -sun_l;
 
-    // Directional face contrast
     var face_factor = 0.78;
     if n.y > 0.5 {
         face_factor = 1.00;
@@ -261,40 +347,40 @@ fn shade_voxel(in: VertexOutput) -> vec3<f32> {
         face_factor = 0.74;
     }
 
-    // Task 1.2: Vertex Corner AO factor `vec4(0.4, 0.65, 0.82, 1.0)[ao_level]`
+    // Vertex Corner AO factor `vec4(0.4, 0.65, 0.82, 1.0)[ao_level]`
     let ao_level = clamp(u32(round(in.ao_and_flags.x)), 0u, 3u);
     let ao_lut = vec4<f32>(0.40, 0.65, 0.82, 1.00);
     let ao_factor = ao_lut[ao_level];
 
-    // Task 2.3: 3x3 PCF Shadow visibility (if shadowed, direct sun_diff drops to 0 -> ambient level)
-    let shadow_vis = sample_sun_shadow(in.world_pos, n);
+    // 16-Point Poisson PCF Shadow + Cloud Ground Shadow
+    let shadow_vis = sample_sun_shadow(in.world_pos, n, in.clip_position.xy)
+        * sample_cloud_shadow(in.world_pos, sun_l);
 
     let sun_diff = max(dot(n, sun_l), 0.0) * clamp(sun_l.y + 0.15, 0.0, 1.0) * shadow_vis;
     let moon_diff = max(dot(n, moon_l), 0.0) * clamp(moon_l.y + 0.10, 0.0, 1.0) * shadow_vis;
     let moon_term = (0.24 * moon_diff) * vec3<f32>(0.45, 0.62, 0.95);
 
-    // Voxel RGB artificial/filtered light (0..15 -> 0.0..1.0) & Sunlight channel (0..15 -> 0.0..1.0)
     let rgb_light = in.light.xyz * 0.06667;
     let sun_ambient = vec3<f32>(camera.sun_dir.w) * 0.42;
     let sun_direct = camera.sun_color.rgb * (0.95 * sun_diff) + moon_term;
     let sun_light = (in.light.w * 0.06667) * (sun_ambient + sun_direct);
 
-    // Unfading night Ambient Floor (`vec3(0.04, 0.06, 0.12)`)
     let ambient_floor = vec3<f32>(0.04, 0.06, 0.12);
     let final_light = (max(rgb_light, sun_light) + ambient_floor) * face_factor * ao_factor;
 
-    let clamped_srgb = min(in.color, vec3<f32>(1.0));
+    let clamped_srgb = clamp(in.color, vec3<f32>(0.0), vec3<f32>(1.0));
     let albedo = pow(clamped_srgb, vec3<f32>(2.2));
 
-    // Task 3.1: Emissive blocks (Lava, Torch, Fire, active Alloy Smelter / Furnace / Generator)
-    // output HDR radiance `base_color * emission_intensity` (from 2.0 to 6.0) for Bloom!
-    let peak = max(in.color.r, max(in.color.g, in.color.b));
-    if peak > 1.02 {
-        let emission_intensity = 2.2 + clamp((peak - 1.0) * 3.8, 0.0, 3.8); // 2.2 .. 6.0
-        return albedo * emission_intensity;
+    // Task 2.1: Strict Bloom Isolation — ONLY `MAT_FIRE (3.0)` and `MAT_EMISSIVE (4.0)`
+    // (`Lava`, `Torch` flame, `Fire`, and active `ElectricFurnace` / `CoalGenerator` / furnaces)
+    // emit HDR radiance > 1.0! Glass, TNT, and terrain are strictly clamped to [0.0, 1.0].
+    let mat_flag = in.ao_and_flags.y;
+    let is_emissive = abs(mat_flag - 3.0) < 0.25 || abs(mat_flag - 4.0) < 0.25;
+    if is_emissive {
+        return albedo * 3.4;
     }
 
-    return albedo * final_light;
+    return clamp(albedo * final_light, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 fn linearize_depth(d: f32) -> f32 {
@@ -316,17 +402,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_translucent(in: VertexOutput) -> @location(0) vec4<f32> {
-    let is_water = abs(in.ao_and_flags.y - 1.0) < 0.25;
+    let mat_flag = in.ao_and_flags.y;
+    let is_water = abs(mat_flag - 1.0) < 0.25;
 
-    // ── Task 5: Dynamic Water (Fresnel Reflection + Depth Fade + Shoreline Foam) ──
+    // ── Task 1.1 & Task 5: Clean Dynamic Water (Zero Underwater Edge Grids) ──
     if is_water {
         let n = normalize(in.normal);
         let view_dir = normalize(camera.cam_pos.xyz - in.world_pos);
         let ndotv = clamp(dot(view_dir, n), 0.0, 1.0);
-        // Task 5.2: Fresnel `pow(1.0 - dot(view_dir, normal), 3.0)`
         let fresnel = pow(1.0 - ndotv, 3.0);
 
-        // Task 5.3: Depth Fade against opaque riverbed in `scene_depth_tex`
+        // Depth Fade against opaque riverbed in `scene_depth_tex` (NO depth-based foam!)
         let dims = vec2<i32>(textureDimensions(scene_depth_tex));
         let px = clamp(vec2<i32>(in.clip_position.xy), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
         let bg_depth = textureLoad(scene_depth_tex, px, 0);
@@ -334,41 +420,59 @@ fn fs_translucent(in: VertexOutput) -> @location(0) vec4<f32> {
         let water_dist = linearize_depth(in.clip_position.z);
         let depth_diff = max(bg_dist - water_dist, 0.0);
 
-        // Shallow water near shore is crystal clear; deeper than 3 blocks becomes rich deep ocean blue
-        let depth_factor = clamp(depth_diff / 3.2, 0.0, 1.0);
-        let shallow_col = vec3<f32>(0.06, 0.34, 0.58);
-        let deep_col    = vec3<f32>(0.012, 0.055, 0.20);
-        var water_albedo = mix(shallow_col, deep_col, depth_factor);
+        let depth_factor = clamp(depth_diff / 3.5, 0.0, 1.0);
+        let shallow_col = vec3<f32>(0.05, 0.30, 0.54);
+        let deep_col    = vec3<f32>(0.010, 0.048, 0.18);
+        let water_albedo = mix(shallow_col, deep_col, depth_factor);
 
-        // Lighting on water
-        let shadow_vis = sample_sun_shadow(in.world_pos, n);
+        let shadow_vis = sample_sun_shadow(in.world_pos, n, in.clip_position.xy);
         let sun_l = normalize(camera.sun_dir.xyz);
         let sun_diff = max(dot(n, sun_l), 0.0) * shadow_vis;
-        let light_scale = max(in.light.xyz * 0.06667, vec3<f32>(in.light.w * 0.06667) * (camera.sun_color.rgb * (0.4 + 0.6 * sun_diff) + vec3<f32>(camera.sun_dir.w) * 0.4))
-            + vec3<f32>(0.05, 0.07, 0.14);
+        let light_scale = max(
+            in.light.xyz * 0.06667,
+            vec3<f32>(in.light.w * 0.06667) * (camera.sun_color.rgb * (0.45 + 0.55 * sun_diff) + vec3<f32>(camera.sun_dir.w) * 0.42)
+        ) + vec3<f32>(0.05, 0.07, 0.14);
+
         var water_col = water_albedo * light_scale;
 
-        // Sky & solar specular reflection via Fresnel
-        let reflect_dir = reflect(-view_dir, n);
-        let sun_spec = pow(max(dot(reflect_dir, sun_l), 0.0), 48.0) * shadow_vis;
-        let sky_reflect = camera.sky_color.rgb * 1.15 + camera.sun_color.rgb * sun_spec * 2.4;
-        water_col = mix(water_col, sky_reflect, clamp(fresnel * 0.78, 0.0, 0.92));
+        // Sky reflection via Fresnel (clamped <= 1.0 so water never blooms)
+        let sky_reflect = clamp(camera.sky_color.rgb * 1.05, vec3<f32>(0.0), vec3<f32>(0.95));
+        water_col = mix(water_col, sky_reflect, clamp(fresnel * 0.72, 0.0, 0.85));
 
-        // Thin white shoreline foam where `depth_diff` is small (`0.0 .. 0.22` blocks)
-        let foam = (1.0 - smoothstep(0.02, 0.22, depth_diff)) * step(0.001, depth_diff);
-        let foam_col = vec3<f32>(0.92, 0.96, 1.00) * max(light_scale, vec3<f32>(0.35));
-        water_col = mix(water_col, foam_col, foam * 0.82);
+        // Task 1.1: Shoreline foam ONLY on the top water plane (`in.normal.y > 0.5`) where it
+        // directly touches a solid dry-land block protruding at `y` or `y + 1` (`shore_mask`)!
+        var foam = 0.0;
+        if in.normal.y > 0.5 {
+            let mask = u32(round(in.ao_and_flags.x));
+            let fx = fract(in.world_pos.x);
+            let fz = fract(in.world_pos.z);
+            if (mask & 1u) != 0u {
+                foam = max(foam, smoothstep(0.90, 0.99, fx));
+            }
+            if (mask & 2u) != 0u {
+                foam = max(foam, 1.0 - smoothstep(0.01, 0.10, fx));
+            }
+            if (mask & 4u) != 0u {
+                foam = max(foam, smoothstep(0.90, 0.99, fz));
+            }
+            if (mask & 8u) != 0u {
+                foam = max(foam, 1.0 - smoothstep(0.01, 0.10, fz));
+            }
+        }
+        let foam_col = clamp(vec3<f32>(0.90, 0.94, 0.98) * max(light_scale, vec3<f32>(0.35)), vec3<f32>(0.0), vec3<f32>(0.95));
+        water_col = clamp(mix(water_col, foam_col, foam * 0.75), vec3<f32>(0.0), vec3<f32>(0.98));
 
-        // Alpha: crystal-transparent near shore & straight-down view, opaque in deep water or grazing Fresnel
-        let base_alpha = mix(0.28, 0.88, depth_factor);
-        let alpha = clamp(max(base_alpha, fresnel * 0.85 + foam * 0.75), 0.25, 0.94);
+        let base_alpha = mix(0.32, 0.86, depth_factor);
+        let alpha = clamp(max(base_alpha, fresnel * 0.80 + foam * 0.70), 0.28, 0.92);
         return vec4<f32>(water_col, alpha);
     }
 
     let lit = shade_voxel(in);
-    let peak = max(in.color.r, max(in.color.g, in.color.b));
-    let alpha = select(0.60, 0.86, peak > 1.05);
-    var final_color = vec4<f32>(lit, alpha);
+    let is_fire = abs(mat_flag - 3.0) < 0.25;
+    let alpha = select(0.60, 0.88, is_fire);
+    // Task 2.1: Stained glass (`mat_flag == 2.0`) is strictly clamped <= 1.0 (emission = 0.0)
+    let out_rgb = select(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), lit, is_fire);
+    var final_color = vec4<f32>(out_rgb, alpha);
     if camera.sun_color.w > 0.5 {
         let uw = pow(vec3<f32>(0.05, 0.25, 0.60), vec3<f32>(2.2));
         final_color = mix(final_color, vec4<f32>(uw, alpha), 0.5);
@@ -453,7 +557,7 @@ pub fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
 }
 
 /// Bind group layout `@group(1)` holding the 2048x2048 Shadow Map, comparison sampler,
-/// and the opaque scene depth texture copy (used for Water Depth Fade & Shoreline Foam).
+/// and the opaque scene depth texture copy (used for Water Depth Fade).
 pub fn create_scene_env_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("scene_env_bgl"),

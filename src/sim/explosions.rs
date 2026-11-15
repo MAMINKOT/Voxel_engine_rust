@@ -316,15 +316,15 @@ impl ExplosionSystem {
     /// Appends 3D flashing cubes for all active `PrimedTnt` entities to a dynamic mesh.
     pub fn append_mesh(&self, vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
         for tnt in &self.primed {
-            // Flash white every 4 ticks (hissing/blinking effect), emissive > 1.0 so it glows
+            // Flash white every 4 ticks (hissing/blinking effect), clamped <= 1.0 (non-emissive)
             let flash_white = (tnt.fuse_ticks / 4) % 2 == 0;
             let side_color = if flash_white {
-                [1.95, 1.95, 1.95]
+                [1.0, 1.0, 1.0]
             } else {
                 [0.92, 0.20, 0.16]
             };
             let top_color = if flash_white {
-                [1.95, 1.95, 1.95]
+                [1.0, 1.0, 1.0]
             } else {
                 [0.95, 0.90, 0.85]
             };

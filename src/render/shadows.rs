@@ -21,6 +21,7 @@ struct CameraUniform {
     sky_color:       vec4<f32>,
     cam_pos:         vec4<f32>,
     sun_screen:      vec4<f32>,
+    render_params:   vec4<f32>,
 };
 
 @group(0) @binding(0)

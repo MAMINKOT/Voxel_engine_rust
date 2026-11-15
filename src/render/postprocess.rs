@@ -16,6 +16,7 @@ struct CameraUniform {
     sky_color:       vec4<f32>,
     cam_pos:         vec4<f32>,
     sun_screen:      vec4<f32>, // xy = sun screen UV (0..1), z = godray intensity, w = aspect
+    render_params:   vec4<f32>, // x = shadow_quality, y = bloom_strength, z = clouds_enabled, w = water_waves
 };
 
 struct FsVarying {
@@ -162,31 +163,16 @@ fn compute_god_rays(uv: vec2<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_composite(in: FsVarying) -> @location(0) vec4<f32> {
-    let centered = in.uv * 2.0 - vec2<f32>(1.0, 1.0);
-    let r2 = dot(centered, centered);
+    // Exact 1:1 integer pixel fetch from the full-resolution HDR framebuffer (zero subpixel blur!)
+    let dims = vec2<i32>(textureDimensions(src_tex));
+    let px = clamp(vec2<i32>(in.clip_position.xy), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
+    let scene_color = textureLoad(src_tex, px, 0).rgb + compute_god_rays(in.uv);
 
-    // 1. Subtle radial Chromatic Aberration near screen edges
-    let ca_offset = centered * (0.0014 * r2);
-    let r_chan = textureSample(src_tex, lin_sampler, clamp(in.uv + ca_offset, vec2<f32>(0.0), vec2<f32>(1.0))).r;
-    let g_chan = textureSample(src_tex, lin_sampler, in.uv).g;
-    let b_chan = textureSample(src_tex, lin_sampler, clamp(in.uv - ca_offset, vec2<f32>(0.0), vec2<f32>(1.0))).b;
-    var hdr = vec3<f32>(r_chan, g_chan, b_chan);
+    let bloom_color = textureSample(bloom_tex, lin_sampler, in.uv).rgb;
+    let bloom_strength = camera.render_params.y;
+    let final_color = aces_tonemap(scene_color + bloom_color * bloom_strength);
 
-    // 2. Add Kawase Dual-Filter Bloom
-    let bloom = textureSample(bloom_tex, lin_sampler, in.uv).rgb;
-    hdr += bloom * 0.85;
-
-    // 3. Add Volumetric Screen-Space God Rays (Additive Blending)
-    hdr += compute_god_rays(in.uv);
-
-    // 4. ACES Filmic Tonemapping
-    var mapped = aces_tonemap(hdr);
-
-    // 5. Subtle Vignette (up to 15% darkening at screen corners)
-    let vignette = 1.0 - 0.15 * smoothstep(0.30, 1.85, r2);
-    mapped *= vignette;
-
-    return vec4<f32>(mapped, 1.0);
+    return vec4<f32>(final_color, 1.0);
 }
 "#;
 

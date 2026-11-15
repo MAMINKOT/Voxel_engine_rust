@@ -25,6 +25,8 @@ use crate::voxel::chunk::{
 pub const MAX_FLUID_LEVEL: u8 = 8;
 /// Fluids update once every 4 logic ticks (5 updates/sec at 20 TPS).
 pub const FLUID_TICK_INTERVAL: u32 = 4;
+/// Radius (in blocks) within which water searches for a downhill ledge/drop-off.
+const SLOPE_SEARCH_RADIUS: i32 = 4;
 
 const HORIZONTAL_DIRS: [IVec3; 4] = [
     IVec3::new(1, 0, 0),
@@ -183,6 +185,61 @@ impl FluidSimulator {
         false
     }
 
+    /// Searches up to `SLOPE_SEARCH_RADIUS` (4) blocks horizontally from `pos + first_dir`
+    /// to find the shortest distance (`1..=4`) to a ledge/drop-off where the block below
+    /// `(p - Y)` is not solid.
+    fn distance_to_dropoff<F: Fn(IVec3) -> BlockId>(
+        pos: IVec3,
+        first_dir: IVec3,
+        kind: BlockId,
+        get_block: &F,
+    ) -> Option<i32> {
+        let can_pass = |p: IVec3| -> bool {
+            let b = get_block(p);
+            b == AIR || b == FIRE || b == kind
+        };
+        let is_dropoff = |p: IVec3| -> bool {
+            let below = get_block(p - IVec3::Y);
+            !is_solid_block(below)
+        };
+
+        let start = pos + first_dir;
+        if !can_pass(start) {
+            return None;
+        }
+        if is_dropoff(start) {
+            return Some(1);
+        }
+
+        let mut visited: Vec<IVec3> = Vec::with_capacity(32);
+        visited.push(pos);
+        visited.push(start);
+
+        let mut frontier: Vec<(IVec3, i32)> = Vec::with_capacity(16);
+        frontier.push((start, 1));
+        let mut head = 0;
+
+        while head < frontier.len() {
+            let (cur, dist) = frontier[head];
+            head += 1;
+            if dist >= SLOPE_SEARCH_RADIUS {
+                continue;
+            }
+            for d in HORIZONTAL_DIRS {
+                let next = cur + d;
+                if visited.contains(&next) || !can_pass(next) {
+                    continue;
+                }
+                if is_dropoff(next) {
+                    return Some(dist + 1);
+                }
+                visited.push(next);
+                frontier.push((next, dist + 1));
+            }
+        }
+        None
+    }
+
     /// Advances the fluid cellular automaton once every `FLUID_TICK_INTERVAL` (4) logic ticks.
     /// Processes only the currently queued coordinates from `self.queue`.
     pub fn tick<F: Fn(IVec3) -> BlockId>(&mut self, get_block: F) -> Vec<(IVec3, BlockId)> {
@@ -322,6 +379,9 @@ impl FluidSimulator {
             }
 
             // 4. Horizontal spreading (`+X, -X, +Z, -Z`) when supported by a solid block below.
+            //    Slope-seeking rule: scan radius 4 around `pos` for any drop-off ledge. If one or
+            //    more directions reach a drop-off within 4 blocks, direct the flow ONLY along the
+            //    direction(s) with the shortest distance to the drop-off!
             let below = pos - IVec3::Y;
             let b_below = get_block(below);
             if !is_solid_block(b_below) || cell.level <= 1 {
@@ -337,12 +397,47 @@ impl FluidSimulator {
             }
             let new_level = cell.level - step_drop;
 
-            for d in HORIZONTAL_DIRS {
+            let mut dir_distances: [Option<i32>; 4] = [None; 4];
+            let mut min_drop_dist: Option<i32> = None;
+            for (i, &d) in HORIZONTAL_DIRS.iter().enumerate() {
+                if let Some(dist) = Self::distance_to_dropoff(pos, d, cell.kind, &get_block) {
+                    dir_distances[i] = Some(dist);
+                    min_drop_dist = Some(match min_drop_dist {
+                        Some(cur_min) => cur_min.min(dist),
+                        None => dist,
+                    });
+                }
+            }
+
+            for (i, d) in HORIZONTAL_DIRS.into_iter().enumerate() {
                 let np = pos + d;
                 if crystallized.contains(&np) {
                     continue;
                 }
                 let nb = get_block(np);
+
+                // Always allow immediate Water+Lava crystallization with adjacent neighbors
+                if (cell.kind == WATER && nb == LAVA) || (cell.kind == LAVA && nb == WATER) {
+                    let target_lava = if nb == LAVA { np } else { pos };
+                    let is_src = self
+                        .cells
+                        .get(&target_lava)
+                        .map(|c| c.is_source)
+                        .unwrap_or(true);
+                    let stone_id = if is_src { OBSIDIAN } else { COBBLESTONE };
+                    crystallized.insert(target_lava);
+                    block_edits.push((target_lava, stone_id));
+                    continue;
+                }
+
+                // If a drop-off exists within 4 blocks, ONLY flow along directions that reach
+                // the closest drop-off!
+                if let Some(best) = min_drop_dist {
+                    if dir_distances[i] != Some(best) {
+                        continue;
+                    }
+                }
+
                 if nb == AIR || nb == FIRE {
                     next_cells.push((
                         np,
@@ -365,17 +460,6 @@ impl FluidSimulator {
                             },
                         ));
                     }
-                } else if (cell.kind == WATER && nb == LAVA) || (cell.kind == LAVA && nb == WATER)
-                {
-                    let target_lava = if nb == LAVA { np } else { pos };
-                    let is_src = self
-                        .cells
-                        .get(&target_lava)
-                        .map(|c| c.is_source)
-                        .unwrap_or(true);
-                    let stone_id = if is_src { OBSIDIAN } else { COBBLESTONE };
-                    crystallized.insert(target_lava);
-                    block_edits.push((target_lava, stone_id));
                 }
             }
         }
@@ -428,12 +512,16 @@ mod tests {
     #[test]
     fn water_falls_over_ledge_resets_to_level_8_and_flows_another_7_blocks() {
         let mut world_map: HashMap<IVec3, BlockId> = HashMap::new();
-        // Upper ledge at y = 3 for x in 0..=4, lower floor at y = 1 for x in 5..=15
-        for x in 0..=4 {
-            world_map.insert(IVec3::new(x, 3, 0), STONE);
-        }
-        for x in 5..=15 {
-            world_map.insert(IVec3::new(x, 1, 0), STONE);
+        // Solid upper ledge up to y = 3 for x in -5..=4, lower floor at y = 1 for x in 5..=20
+        for z in -10..=10 {
+            for x in -5..=4 {
+                for y in 1..=3 {
+                    world_map.insert(IVec3::new(x, y, z), STONE);
+                }
+            }
+            for x in 5..=20 {
+                world_map.insert(IVec3::new(x, 1, z), STONE);
+            }
         }
         // Side walls so water flows along +X
         let mut sim = FluidSimulator::new();
@@ -482,5 +570,35 @@ mod tests {
 
         assert_eq!(world_map.get(&lava_src), Some(&OBSIDIAN));
         assert_eq!(world_map.get(&lava_flow), Some(&COBBLESTONE));
+    }
+
+    #[test]
+    fn water_seeks_slope_within_4_blocks_forming_stream_instead_of_flooding_sideways() {
+        let mut world_map: HashMap<IVec3, BlockId> = HashMap::new();
+        // Create a wide flat stone terrace at y = 3 for x in -6..=3 and z in -6..=6
+        // so there is a drop-off at x = 4 (3 blocks in +X from origin x = 0),
+        // while -X, +Z, and -Z are flat for 6 blocks!
+        for z in -6..=6 {
+            for x in -6..=3 {
+                world_map.insert(IVec3::new(x, 3, z), STONE);
+            }
+        }
+        let mut sim = FluidSimulator::new();
+        let src = IVec3::new(0, 4, 0);
+        world_map.insert(src, WATER);
+        sim.on_block_changed(src, WATER);
+
+        for _ in 0..4 {
+            step_fluid_once(&mut sim, &mut world_map);
+        }
+
+        // Water must flow strictly along +X toward the drop-off at x = 4
+        assert_eq!(world_map.get(&IVec3::new(1, 4, 0)), Some(&WATER));
+        assert_eq!(world_map.get(&IVec3::new(2, 4, 0)), Some(&WATER));
+        assert_eq!(world_map.get(&IVec3::new(3, 4, 0)), Some(&WATER));
+        // And must NOT flood sideways into (0, 4, 1), (0, 4, -1), or (-1, 4, 0)!
+        assert_eq!(world_map.get(&IVec3::new(0, 4, 1)), None);
+        assert_eq!(world_map.get(&IVec3::new(0, 4, -1)), None);
+        assert_eq!(world_map.get(&IVec3::new(-1, 4, 0)), None);
     }
 }

@@ -7,8 +7,8 @@ use glam::{IVec3, Vec3};
 
 use crate::voxel::chunk::{
     base_block_id, block_color, block_face_color, fluid_level_from_id, is_active_block,
-    is_energy_connectable, is_fluid, is_full_cube, is_translucent, BlockId, AIR, CABLE, CABLE_MAX,
-    CABLE_MIN, CHUNK_SIZE, FIRE, LAVA, PURPLE_STAINED_GLASS, TORCH, WATER,
+    is_energy_connectable, is_fluid, is_full_cube, is_solid_block, is_translucent, BlockId, AIR,
+    CABLE, CABLE_MAX, CABLE_MIN, CHUNK_SIZE, FIRE, LAVA, PURPLE_STAINED_GLASS, TORCH, WATER,
 };
 use crate::voxel::light::{
     blue_channel, green_channel, light_to_f32_array, pack_light, red_channel, sun_channel,
@@ -20,6 +20,7 @@ pub const MAT_STANDARD: f32 = 0.0;
 pub const MAT_WATER: f32 = 1.0;
 pub const MAT_STAINED_GLASS: f32 = 2.0;
 pub const MAT_FIRE: f32 = 3.0;
+pub const MAT_EMISSIVE: f32 = 4.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -270,6 +271,11 @@ fn emit_quad(
     let mut normal = [0.0f32; 3];
     normal[d] = if positive { 1.0 } else { -1.0 };
     let color = block_face_color(block, d);
+    let mat_flag = if is_active_block(block) {
+        MAT_EMISSIVE
+    } else {
+        MAT_STANDARD
+    };
 
     let base = data.vertices.len() as u32;
     let corners = [(k, j), (k + w, j), (k + w, j + h), (k, j + h)];
@@ -287,7 +293,7 @@ fn emit_quad(
             normal,
             color,
             light,
-            ao_and_flags: [ao[idx] as f32, MAT_STANDARD],
+            ao_and_flags: [ao[idx] as f32, mat_flag],
         });
     }
 
@@ -346,13 +352,10 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
     let nb_visible = |nx: i32, ny: i32, nz: i32| -> bool {
         let n_raw = sample(nx, ny, nz);
         let n_base = base_block_id(n_raw);
-        if is_full_cube(n_raw) {
+        if is_full_cube(n_raw) || n_base == base {
+            // Never emit internal vertical faces between two adjacent blocks of the same fluid
+            // so underwater riverbeds/pools have zero internal grid lines!
             return false;
-        }
-        if n_base == base {
-            // Only show side face if our fluid surface is higher than the neighbor's fluid surface.
-            let nh = fluid_height(nx, ny, nz, n_raw, sample);
-            return h > nh + 0.01;
         }
         true
     };
@@ -369,18 +372,46 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
 
     let mat_flag = if base == WATER {
         MAT_WATER
+    } else if base == LAVA {
+        MAT_EMISSIVE
     } else {
         MAT_STANDARD
     };
 
+    // Shoreline contact mask (bits 0..3 = +X, -X, +Z, -Z): set ONLY when the top water surface
+    // (`show_top`) directly touches a solid land block at `ly` whose top at `ly + 1` is not submerged.
+    let mut shore_mask: u8 = 0;
+    if base == WATER && show_top {
+        let is_dry_shore = |nx: i32, nz: i32| -> bool {
+            let side = sample(nx, ly, nz);
+            let above_side = sample(nx, ly + 1, nz);
+            is_solid_block(side)
+                && base_block_id(side) != PURPLE_STAINED_GLASS
+                && !is_fluid(above_side)
+        };
+        if is_dry_shore(lx + 1, lz) {
+            shore_mask |= 1;
+        }
+        if is_dry_shore(lx - 1, lz) {
+            shore_mask |= 2;
+        }
+        if is_dry_shore(lx, lz + 1) {
+            shore_mask |= 4;
+        }
+        if is_dry_shore(lx, lz - 1) {
+            shore_mask |= 8;
+        }
+    }
+
     let bmin = world_pos.as_vec3();
     let bmax = bmin + Vec3::new(1.0, h, 1.0);
-    emit_box_with_flag(
+    emit_box_with_custom_top_ao(
         data,
         bmin,
         bmax,
         color,
         light,
+        shore_mask as f32,
         mat_flag,
         [show_px, show_nx, show_top, show_bottom, show_pz, show_nz],
     );
@@ -405,7 +436,7 @@ fn emit_fire_voxel(data: &mut MeshData, world_pos: IVec3) {
 fn emit_torch(data: &mut MeshData, world_pos: IVec3) {
     let base_pos = world_pos.as_vec3();
     let light = [15.0, 12.0, 5.0, 15.0];
-    // Wooden handle
+    // Wooden handle (non-emissive)
     emit_box(
         data,
         base_pos + Vec3::new(0.42, 0.0, 0.42),
@@ -414,13 +445,14 @@ fn emit_torch(data: &mut MeshData, world_pos: IVec3) {
         light,
         [true, true, false, true, true, true],
     );
-    // Glowing flame head
-    emit_box(
+    // Glowing flame head (emissive -> triggers Bloom!)
+    emit_box_with_flag(
         data,
         base_pos + Vec3::new(0.40, 0.50, 0.40),
         base_pos + Vec3::new(0.60, 0.66, 0.60),
         block_face_color(TORCH, 1),
         light,
+        MAT_EMISSIVE,
         [true, true, true, false, true, true],
     );
 }
@@ -575,49 +607,69 @@ fn emit_box_with_flag(
     mat_flag: f32,
     faces: [bool; 6],
 ) {
+    emit_box_with_custom_top_ao(data, min, max, color, light, 3.0, mat_flag, faces);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_box_with_custom_top_ao(
+    data: &mut MeshData,
+    min: Vec3,
+    max: Vec3,
+    color: [f32; 3],
+    light: [f32; 4],
+    top_ao_or_mask: f32,
+    mat_flag: f32,
+    faces: [bool; 6],
+) {
     let (x0, y0, z0) = (min.x, min.y, min.z);
     let (x1, y1, z1) = (max.x, max.y, max.z);
 
-    let quads: [(bool, [[f32; 3]; 4], [f32; 3]); 6] = [
+    let quads: [(bool, [[f32; 3]; 4], [f32; 3], f32); 6] = [
         // +X
         (
             faces[0],
             [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]],
             [1.0, 0.0, 0.0],
+            3.0,
         ),
         // -X
         (
             faces[1],
             [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]],
             [-1.0, 0.0, 0.0],
+            3.0,
         ),
         // +Y
         (
             faces[2],
             [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]],
             [0.0, 1.0, 0.0],
+            top_ao_or_mask,
         ),
         // -Y
         (
             faces[3],
             [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
             [0.0, -1.0, 0.0],
+            3.0,
         ),
         // +Z
         (
             faces[4],
             [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
             [0.0, 0.0, 1.0],
+            3.0,
         ),
         // -Z
         (
             faces[5],
             [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
             [0.0, 0.0, -1.0],
+            3.0,
         ),
     ];
 
-    for (enabled, corners, normal) in quads {
+    for (enabled, corners, normal, ao_val) in quads {
         if !enabled {
             continue;
         }
@@ -628,7 +680,7 @@ fn emit_box_with_flag(
                 normal,
                 color,
                 light,
-                ao_and_flags: [3.0, mat_flag],
+                ao_and_flags: [ao_val, mat_flag],
             });
         }
         data.indices

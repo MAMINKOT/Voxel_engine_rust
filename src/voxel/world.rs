@@ -578,8 +578,21 @@ impl World {
         );
     }
 
-    pub fn draw_opaque<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        for m in self.opaque_meshes.values() {
+    pub fn draw_opaque<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        player_pos: Vec3,
+        render_distance_chunks: i32,
+    ) {
+        let n = CHUNK_SIZE as i32;
+        let pcx = (player_pos.x as i32).div_euclid(n);
+        let pcz = (player_pos.z as i32).div_euclid(n);
+        let max_d = render_distance_chunks.max(1);
+
+        for (coord, m) in &self.opaque_meshes {
+            if (coord.x - pcx).abs() > max_d || (coord.z - pcz).abs() > max_d {
+                continue;
+            }
             pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
             pass.set_index_buffer(m.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..m.index_count, 0, 0..1);
@@ -591,8 +604,21 @@ impl World {
         }
     }
 
-    pub fn draw_translucent<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        for m in self.translucent_meshes.values() {
+    pub fn draw_translucent<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        player_pos: Vec3,
+        render_distance_chunks: i32,
+    ) {
+        let n = CHUNK_SIZE as i32;
+        let pcx = (player_pos.x as i32).div_euclid(n);
+        let pcz = (player_pos.z as i32).div_euclid(n);
+        let max_d = render_distance_chunks.max(1);
+
+        for (coord, m) in &self.translucent_meshes {
+            if (coord.x - pcx).abs() > max_d || (coord.z - pcz).abs() > max_d {
+                continue;
+            }
             pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
             pass.set_index_buffer(m.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..m.index_count, 0, 0..1);

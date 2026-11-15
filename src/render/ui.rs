@@ -20,6 +20,7 @@ use crate::inventory::{
 };
 use crate::sim::energy_net::EnergyNetwork;
 use crate::ui::debug::{draw_debug_overlay, DebugInfo};
+use crate::ui::menu::{draw_options_menu, draw_pause_menu, GraphicsSettings, PauseMenuAction};
 use crate::voxel::chunk::{
     block_color, block_name, BlockId, ALL_ITEMS, ALLOY_SMELTER, BATBOX, CHEST, COAL_GENERATOR,
     COAL_ORE, ELECTRIC_FURNACE, SIMPLE_FURNACE, WORKBENCH,
@@ -30,6 +31,8 @@ pub enum UiScreen {
     Closed,
     Inventory,
     Machine(IVec3),
+    PauseMenu,
+    OptionsMenu,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -65,6 +68,10 @@ impl UiSystem {
 
     pub fn is_open(&self) -> bool {
         self.screen != UiScreen::Closed
+    }
+
+    pub fn is_paused(&self) -> bool {
+        matches!(self.screen, UiScreen::PauseMenu | UiScreen::OptionsMenu)
     }
 
     pub fn on_cursor_moved(&mut self, x: f64, y: f64, scale_factor: f32) {
@@ -103,9 +110,10 @@ impl UiSystem {
         dt: f32,
         inventory: &mut PlayerInventory,
         energy: &mut EnergyNetwork,
+        settings: &mut GraphicsSettings,
         debug_info: Option<&DebugInfo>,
         block_at: impl Fn(IVec3) -> BlockId,
-    ) {
+    ) -> PauseMenuAction {
         if let UiScreen::Machine(pos) = self.screen {
             if !energy.is_interactive(pos) {
                 self.screen = UiScreen::Closed;
@@ -131,6 +139,7 @@ impl UiSystem {
         let screen = self.screen;
         let cursor_pos = self.cursor_pos;
         let mut nei_query = self.nei_query;
+        let mut menu_action = PauseMenuAction::None;
 
         let full_output = self.ctx.run(raw_input, |ctx| {
             if let Some(info) = debug_info {
@@ -148,9 +157,15 @@ impl UiSystem {
                     let kind = block_at(pos);
                     draw_machine_window(ctx, pos, kind, inventory, energy);
                 }
+                UiScreen::PauseMenu => {
+                    menu_action = draw_pause_menu(ctx);
+                }
+                UiScreen::OptionsMenu => {
+                    menu_action = draw_options_menu(ctx, settings);
+                }
             }
 
-            if screen != UiScreen::Closed {
+            if matches!(screen, UiScreen::Inventory | UiScreen::Machine(_)) {
                 draw_nei_sidebar(ctx, &energy.recipes, inventory, &mut nei_query);
 
                 if let Some(held) = inventory.cursor_item {
@@ -193,6 +208,8 @@ impl UiSystem {
         for id in &full_output.textures_delta.free {
             self.renderer.free_texture(id);
         }
+
+        menu_action
     }
 }
 

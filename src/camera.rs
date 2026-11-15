@@ -83,6 +83,8 @@ pub struct CameraUniform {
     pub cam_pos: [f32; 4],
     /// `xy` = Sun screen-space UV (`0..1`), `z` = Volumetric God Rays visibility, `w` = aspect ratio.
     pub sun_screen: [f32; 4],
+    /// `[shadow_quality (0/1/2), bloom_strength (0..1), clouds_enabled (0/1), water_waves (0/1)]`.
+    pub render_params: [f32; 4],
 }
 
 impl CameraUniform {
@@ -91,6 +93,7 @@ impl CameraUniform {
         sky: &crate::render::sky::SkyState,
         is_underwater: bool,
         elapsed_secs: f32,
+        settings: &crate::ui::menu::GraphicsSettings,
     ) -> Self {
         let dir = sky.sun_direction();
         let col = sky.sun_color();
@@ -138,6 +141,12 @@ impl CameraUniform {
                 elapsed_secs,
             ],
             sun_screen: [sun_u, sun_v, godray_vis, camera.aspect],
+            render_params: [
+                settings.shadow_quality.as_shader_code(),
+                settings.effective_bloom_strength(),
+                if settings.clouds_enabled { 1.0 } else { 0.0 },
+                if settings.water_waves { 1.0 } else { 0.0 },
+            ],
         }
     }
 

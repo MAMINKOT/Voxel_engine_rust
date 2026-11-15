@@ -24,6 +24,7 @@ use winit::window::{CursorGrabMode, Window, WindowBuilder};
 use crate::camera::{Camera, CameraController, CameraUniform};
 use crate::inventory::PlayerInventory;
 use crate::player::Player;
+use crate::render::clouds::CloudRenderer;
 use crate::render::overlay::OverlayRenderer;
 use crate::render::pipeline::{
     create_camera_bind_group, create_camera_bind_group_layout, create_camera_buffer,
@@ -36,6 +37,7 @@ use crate::render::sky::SkyState;
 use crate::render::ui::{UiScreen, UiSystem};
 use crate::sim::energy_net::TICK_DT;
 use crate::ui::debug::DebugInfo;
+use crate::ui::menu::{GraphicsSettings, PauseMenuAction, ShadowQuality};
 use crate::voxel::chunk::{is_fluid, is_placeable, AIR, FIRE, LIGHTER, TNT, WATER};
 use crate::voxel::raycast::{raycast_blocks, RaycastHit};
 use crate::voxel::world::World;
@@ -82,6 +84,7 @@ struct GpuState {
     depth_texture: DepthTexture,
     scene_depth_copy: DepthTexture,
     shadows: ShadowRenderer,
+    clouds: CloudRenderer,
     scene_env_bgl: wgpu::BindGroupLayout,
     scene_env_bg: wgpu::BindGroup,
     postprocess: PostProcessor,
@@ -105,6 +108,8 @@ struct Engine {
     sky: SkyState,
     player: Player,
     inventory: PlayerInventory,
+    settings: GraphicsSettings,
+    quit_requested: bool,
     target: Option<RaycastHit>,
     tick_accum: f32,
     elapsed_secs: f32,
@@ -243,17 +248,26 @@ impl Engine {
                     self.sky.skip(150.0);
                     return;
                 }
-                // Escape: close UI if open, otherwise release cursor.
+                // Escape: close Inventory/Machine UI if open; otherwise toggle Pause Menu (`GameState::Paused`).
                 if code == KeyCode::Escape {
-                    if self.gpu.ui.is_open() {
-                        self.close_ui(true);
-                    } else {
-                        self.grab_cursor(false);
+                    match self.gpu.ui.screen {
+                        UiScreen::Inventory | UiScreen::Machine(_) | UiScreen::PauseMenu => {
+                            self.close_ui(true);
+                        }
+                        UiScreen::OptionsMenu => {
+                            self.gpu.ui.screen = UiScreen::PauseMenu;
+                        }
+                        UiScreen::Closed => {
+                            self.open_ui(UiScreen::PauseMenu);
+                        }
                     }
                     return;
                 }
-                // E / I / Tab: toggle inventory / close machine UI.
+                // E / I / Tab: toggle inventory / close machine UI (ignored while in Pause/Options menu).
                 if matches!(code, KeyCode::KeyE | KeyCode::KeyI | KeyCode::Tab) {
+                    if self.gpu.ui.is_paused() {
+                        return;
+                    }
                     if self.gpu.ui.is_open() {
                         self.close_ui(true);
                     } else {
@@ -382,6 +396,23 @@ impl Engine {
         // Cap dt to prevent spiral-of-death after alt-tab / breakpoints.
         let dt_secs = dt.as_secs_f32().min(0.1);
         self.last_dt_secs = dt_secs;
+
+        // Apply live FOV from Graphics Settings
+        self.camera.fov_y_rad = self.settings.fov_deg.clamp(60.0, 110.0).to_radians();
+
+        let one_sec_elapsed = self.fps_counter.tick(dt).is_some();
+        if one_sec_elapsed {
+            self.refresh_memory_stats();
+        }
+
+        // When in Pause Menu / Options Menu (`GameState::Paused`), freeze world simulation & player movement.
+        if self.gpu.ui.is_paused() {
+            if one_sec_elapsed {
+                self.refresh_title();
+            }
+            return;
+        }
+
         self.elapsed_secs = (self.elapsed_secs + dt_secs) % 100_000.0;
 
         // Advance Day/Night cycle.
@@ -435,11 +466,6 @@ impl Engine {
             self.target.map(|h| (h.bounds_min, h.bounds_max)),
         );
 
-        let one_sec_elapsed = self.fps_counter.tick(dt).is_some();
-        if one_sec_elapsed {
-            self.refresh_memory_stats();
-        }
-
         if cur_target != prev_target {
             if let Some(pos) = cur_target {
                 if let Some(status) = self.gpu.world.energy.status(pos) {
@@ -459,15 +485,18 @@ impl Engine {
         let eye_cell = self.camera.position.floor().as_ivec3();
         let is_underwater = self.gpu.world.block(eye_cell) == WATER;
 
-        // Upload camera + directional shadow matrix + dynamic sun + water wave time uniform.
+        // Upload camera + directional shadow matrix + dynamic sun + water wave time + graphics settings uniform.
         let uniform = CameraUniform::from_camera_and_sky(
             &self.camera,
             &self.sky,
             is_underwater,
             self.elapsed_secs,
+            &self.settings,
         );
         self.gpu.queue.write_buffer(&self.gpu.camera_buffer, 0, uniform.as_bytes());
         let clear_color = self.sky.clear_color();
+        let player_pos = self.player.position();
+        let render_dist = self.settings.render_distance_chunks;
 
         let output = self.gpu.surface.get_current_texture()?;
         let view = output
@@ -478,8 +507,8 @@ impl Engine {
             &wgpu::CommandEncoderDescriptor { label: Some("render_encoder") },
         );
 
-        // 1. Directional Shadow Pass (`2048x2048` Depth32Float)
-        {
+        // 1. Directional Shadow Pass (`2048x2048` Depth32Float) when Shadows != Off
+        if self.settings.shadow_quality != ShadowQuality::Off {
             let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sun_shadow_pass"),
                 color_attachments: &[],
@@ -496,7 +525,9 @@ impl Engine {
             });
             shadow_pass.set_pipeline(&self.gpu.shadows.pipeline);
             shadow_pass.set_bind_group(0, &self.gpu.camera_bind_group, &[]);
-            self.gpu.world.draw_opaque(&mut shadow_pass);
+            self.gpu
+                .world
+                .draw_opaque(&mut shadow_pass, player_pos, render_dist);
         }
 
         // 2. HDR Sky + Opaque Voxel Pass (`Rgba16Float` + `depth_texture`)
@@ -532,7 +563,9 @@ impl Engine {
             pass.set_pipeline(&self.gpu.render_pipeline);
             pass.set_bind_group(0, &self.gpu.camera_bind_group, &[]);
             pass.set_bind_group(1, &self.gpu.scene_env_bg, &[]);
-            self.gpu.world.draw_opaque(&mut pass);
+            self.gpu
+                .world
+                .draw_opaque(&mut pass, player_pos, render_dist);
         }
 
         // 3. Copy opaque depth buffer to `scene_depth_copy` for Water Depth Fade & God Rays
@@ -556,7 +589,7 @@ impl Engine {
             },
         );
 
-        // 4. HDR Translucent Pass (Water with Waves/Fresnel/Depth Fade, Fire, Stained Glass) + Wireframe
+        // 4. HDR Translucent Pass (Clouds at Y=128, Water with Waves/Fresnel/Depth Fade, Fire, Stained Glass) + Wireframe
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("hdr_translucent_pass"),
@@ -580,10 +613,16 @@ impl Engine {
                 timestamp_writes: None,
             });
 
+            if self.settings.clouds_enabled {
+                self.gpu.clouds.draw(&mut pass, &self.gpu.camera_bind_group);
+            }
+
             pass.set_pipeline(&self.gpu.translucent_pipeline);
             pass.set_bind_group(0, &self.gpu.camera_bind_group, &[]);
             pass.set_bind_group(1, &self.gpu.scene_env_bg, &[]);
-            self.gpu.world.draw_translucent(&mut pass);
+            self.gpu
+                .world
+                .draw_translucent(&mut pass, player_pos, render_dist);
 
             self.gpu.overlay.draw_wire(&mut pass);
         }
@@ -646,7 +685,7 @@ impl Engine {
         let GpuState { device, queue, world, ui, .. } = &mut self.gpu;
         let mut energy =
             std::mem::replace(&mut world.energy, crate::sim::energy_net::EnergyNetwork::new());
-        ui.render(
+        let menu_action = ui.render(
             device,
             queue,
             &mut encoder,
@@ -657,10 +696,27 @@ impl Engine {
             self.last_dt_secs,
             &mut self.inventory,
             &mut energy,
+            &mut self.settings,
             debug_info.as_ref(),
             |p| world.block(p),
         );
         world.energy = energy;
+
+        match menu_action {
+            PauseMenuAction::None => {}
+            PauseMenuAction::Resume => {
+                self.close_ui(true);
+            }
+            PauseMenuAction::OpenOptions => {
+                self.gpu.ui.screen = UiScreen::OptionsMenu;
+            }
+            PauseMenuAction::BackToPause => {
+                self.gpu.ui.screen = UiScreen::PauseMenu;
+            }
+            PauseMenuAction::Quit => {
+                self.quit_requested = true;
+            }
+        }
 
         self.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
@@ -730,14 +786,21 @@ async fn init_gpu(window: Arc<Window>) -> GpuState {
     // Camera uniform buffer.
     let cam_placeholder = Camera::new(size.width as f32 / size.height.max(1) as f32);
     let sky_placeholder = SkyState::new();
-    let cam_uniform =
-        CameraUniform::from_camera_and_sky(&cam_placeholder, &sky_placeholder, false, 0.0);
+    let default_settings = GraphicsSettings::default();
+    let cam_uniform = CameraUniform::from_camera_and_sky(
+        &cam_placeholder,
+        &sky_placeholder,
+        false,
+        0.0,
+        &default_settings,
+    );
     let camera_buffer = create_camera_buffer(&device, cam_uniform.as_bytes());
 
     let cam_bgl = create_camera_bind_group_layout(&device);
     let camera_bind_group = create_camera_bind_group(&device, &cam_bgl, &camera_buffer);
 
     let shadows = ShadowRenderer::new(&device, &cam_bgl);
+    let clouds = CloudRenderer::new(&device, &cam_bgl);
     let depth_texture =
         DepthTexture::create(&device, size.width.max(1), size.height.max(1), "depth_texture");
     let scene_depth_copy = DepthTexture::create(
@@ -783,6 +846,7 @@ async fn init_gpu(window: Arc<Window>) -> GpuState {
         depth_texture,
         scene_depth_copy,
         shadows,
+        clouds,
         scene_env_bgl,
         scene_env_bg,
         postprocess,
@@ -823,6 +887,8 @@ pub async fn run() {
         sky: SkyState::new(),
         player: Player::new(Vec3::new(0.5, 36.0, 0.5)),
         inventory: PlayerInventory::new(),
+        settings: GraphicsSettings::default(),
+        quit_requested: false,
         target: None,
         tick_accum: 0.0,
         elapsed_secs: 0.0,
@@ -918,6 +984,11 @@ pub async fn run() {
                             elwt.exit();
                         }
                         Err(e) => log::warn!("Frame skip: {:?}", e),
+                    }
+
+                    if engine.quit_requested {
+                        log::info!("Quit requested from Pause Menu.");
+                        elwt.exit();
                     }
                 }
 
