@@ -35,6 +35,7 @@ struct GpuChunkMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    has_water: bool,
 }
 
 pub struct World {
@@ -178,16 +179,31 @@ fn generate_chunk(coord: IVec3) -> Chunk {
 
 // ─── World ───────────────────────────────────────────────────────────────────
 
-fn block_in_chunks(chunks: &HashMap<IVec3, Chunk>, p: IVec3) -> BlockId {
+fn block_opt_in_chunks(chunks: &HashMap<IVec3, Chunk>, p: IVec3) -> Option<BlockId> {
     let n = CHUNK_SIZE as i32;
     let coord = IVec3::new(p.x.div_euclid(n), p.y.div_euclid(n), p.z.div_euclid(n));
     if coord.y < 0 {
-        return BEDROCK;
+        return Some(BEDROCK);
     }
-    match chunks.get(&coord) {
-        Some(c) => c.get_block(p.x.rem_euclid(n), p.y.rem_euclid(n), p.z.rem_euclid(n)),
-        None => AIR,
+    if coord.y > 0 {
+        // Above the 32-high chunk column: return Air only if the ground chunk column is loaded.
+        return if chunks.contains_key(&IVec3::new(coord.x, 0, coord.z)) {
+            Some(AIR)
+        } else {
+            None
+        };
     }
+    chunks.get(&coord).map(|c| {
+        c.get_block(
+            p.x.rem_euclid(n),
+            p.y.rem_euclid(n),
+            p.z.rem_euclid(n),
+        )
+    })
+}
+
+fn block_in_chunks(chunks: &HashMap<IVec3, Chunk>, p: IVec3) -> BlockId {
+    block_opt_in_chunks(chunks, p).unwrap_or(AIR)
 }
 
 impl World {
@@ -258,7 +274,9 @@ impl World {
 
         // Step cellular fluid simulation (rate-limited inside FluidSimulator)
         let chunks_ref = &self.chunks;
-        let fluid_edits = self.fluids.tick(|p| block_in_chunks(chunks_ref, p));
+        let fluid_edits = self
+            .fluids
+            .tick(|p| block_opt_in_chunks(chunks_ref, p));
         for (pos, new_id) in fluid_edits {
             let _ = self.set_block_raw(pos, new_id);
             // Always mark dirty because even if `new_id == WATER` was already there, its fluid
@@ -332,6 +350,25 @@ impl World {
         }
 
         total_player_impulse
+    }
+
+    /// Safe chunk-boundary block lookup returning `None` if the target chunk is not loaded.
+    pub fn get_block_opt(&self, p: IVec3) -> Option<BlockId> {
+        block_opt_in_chunks(&self.chunks, p)
+    }
+
+    /// Safe global fluid level lookup (`0.0..=8.0`) across chunk borders.
+    /// Returns `0.0` if the target chunk is unloaded, out of world bounds, or not a fluid.
+    pub fn get_fluid_level_clamped(&self, global_x: i32, global_y: i32, global_z: i32) -> f32 {
+        let p = IVec3::new(global_x, global_y, global_z);
+        let Some(b) = self.get_block_opt(p) else {
+            return 0.0;
+        };
+        if is_fluid(b) {
+            self.fluids.level_at(p).unwrap_or(8).clamp(1, 8) as f32
+        } else {
+            0.0
+        }
     }
 
     /// World-space block lookup across chunk borders. Below the world is bedrock,
@@ -483,7 +520,7 @@ impl World {
         }
         let (mut vertices, mut indices) = build_drops_mesh(items);
         self.explosions.append_mesh(&mut vertices, &mut indices);
-        if indices.is_empty() {
+        if vertices.is_empty() || indices.is_empty() {
             self.drops_mesh = None;
             return;
         }
@@ -501,30 +538,36 @@ impl World {
             vertex_buffer,
             index_buffer,
             index_count: indices.len() as u32,
+            has_water: false,
         });
     }
 
     /// Greedy-meshes a chunk into separate opaque and translucent vertex/index buffers.
     fn build_mesh(&self, coord: IVec3) -> ChunkMeshData {
         let n = CHUNK_SIZE as i32;
-        let pad = n + 2;
+        // Pad by 2 voxels on every side (-2..=33) so fluid corner averaging and neighbor
+        // lookups across chunk borders never index out of bounds.
+        let pad = n + 4;
+        let pad_u = pad as usize;
         let origin = coord * n;
 
-        let mut cells = vec![AIR; (pad * pad * pad) as usize];
+        let mut cells = vec![AIR; pad_u * pad_u * pad_u];
         for z in 0..pad {
             for y in 0..pad {
                 for x in 0..pad {
-                    let wp = origin + IVec3::new(x - 1, y - 1, z - 1);
-                    let mut b = self.block(wp);
+                    let wp = origin + IVec3::new(x - 2, y - 2, z - 2);
+                    let mut b = self.get_block_opt(wp).unwrap_or(AIR);
                     if b != AIR {
                         if is_fluid(b) {
-                            let lvl = self.fluids.level_at(wp).unwrap_or(8);
+                            let lvl =
+                                (self.get_fluid_level_clamped(wp.x, wp.y, wp.z) as u8).clamp(1, 8);
                             b = with_fluid_level(b, lvl);
                         } else if self.energy.is_machine_active(wp) {
                             b |= ACTIVE_MACHINE_FLAG;
                         }
                     }
-                    cells[(x + y * pad + z * pad * pad) as usize] = b;
+                    let idx = (x as usize) + (y as usize) * pad_u + (z as usize) * pad_u * pad_u;
+                    cells[idx] = b;
                 }
             }
         }
@@ -533,8 +576,29 @@ impl World {
 
         mesh_chunk(
             origin,
-            |x, y, z| cells[((x + 1) + (y + 1) * pad + (z + 1) * pad * pad) as usize],
-            |x, y, z| lights[((x + 1) + (y + 1) * pad + (z + 1) * pad * pad) as usize],
+            |x, y, z| {
+                let (Some(ix), Some(iy), Some(iz)) = (
+                    usize::try_from(x + 2).ok().filter(|&v| v < pad_u),
+                    usize::try_from(y + 2).ok().filter(|&v| v < pad_u),
+                    usize::try_from(z + 2).ok().filter(|&v| v < pad_u),
+                ) else {
+                    let wp = origin + IVec3::new(x, y, z);
+                    return self.get_block_opt(wp).unwrap_or(AIR);
+                };
+                let idx = ix + iy * pad_u + iz * pad_u * pad_u;
+                cells.get(idx).copied().unwrap_or(AIR)
+            },
+            |x, y, z| {
+                let (Some(ix), Some(iy), Some(iz)) = (
+                    usize::try_from(x + 2).ok().filter(|&v| v < pad_u),
+                    usize::try_from(y + 2).ok().filter(|&v| v < pad_u),
+                    usize::try_from(z + 2).ok().filter(|&v| v < pad_u),
+                ) else {
+                    return 0;
+                };
+                let idx = ix + iy * pad_u + iz * pad_u * pad_u;
+                lights.get(idx).copied().unwrap_or(0)
+            },
         )
     }
 
@@ -543,19 +607,30 @@ impl World {
         map: &mut HashMap<IVec3, GpuChunkMesh>,
         coord: IVec3,
         data: MeshData,
+        is_translucent_pass: bool,
     ) {
-        if data.indices.is_empty() {
+        if data.vertices.is_empty() || data.indices.is_empty() {
+            map.remove(&coord);
+            return;
+        }
+        let vertex_bytes = bytemuck::cast_slice(&data.vertices);
+        let index_bytes = bytemuck::cast_slice(&data.indices);
+        if vertex_bytes.is_empty() || index_bytes.is_empty() {
+            log::warn!(
+                "[World] Skipping zero-size WGPU buffer upload for chunk {:?}",
+                coord
+            );
             map.remove(&coord);
             return;
         }
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chunk_vertex_buffer"),
-            contents: bytemuck::cast_slice(&data.vertices),
+            contents: vertex_bytes,
             usage: wgpu::BufferUsages::VERTEX,
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chunk_index_buffer"),
-            contents: bytemuck::cast_slice(&data.indices),
+            contents: index_bytes,
             usage: wgpu::BufferUsages::INDEX,
         });
         map.insert(
@@ -564,17 +639,19 @@ impl World {
                 vertex_buffer,
                 index_buffer,
                 index_count: data.indices.len() as u32,
+                has_water: is_translucent_pass,
             },
         );
     }
 
     fn upload(&mut self, device: &wgpu::Device, coord: IVec3, data: ChunkMeshData) {
-        Self::upload_single(device, &mut self.opaque_meshes, coord, data.opaque);
+        Self::upload_single(device, &mut self.opaque_meshes, coord, data.opaque, false);
         Self::upload_single(
             device,
             &mut self.translucent_meshes,
             coord,
             data.translucent,
+            true,
         );
     }
 
@@ -590,7 +667,7 @@ impl World {
         let max_d = render_distance_chunks.max(1);
 
         for (coord, m) in &self.opaque_meshes {
-            if (coord.x - pcx).abs() > max_d || (coord.z - pcz).abs() > max_d {
+            if m.index_count == 0 || (coord.x - pcx).abs() > max_d || (coord.z - pcz).abs() > max_d {
                 continue;
             }
             pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
@@ -598,9 +675,11 @@ impl World {
             pass.draw_indexed(0..m.index_count, 0, 0..1);
         }
         if let Some(m) = &self.drops_mesh {
-            pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
-            pass.set_index_buffer(m.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..m.index_count, 0, 0..1);
+            if m.index_count > 0 {
+                pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
+                pass.set_index_buffer(m.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..m.index_count, 0, 0..1);
+            }
         }
     }
 
@@ -616,7 +695,11 @@ impl World {
         let max_d = render_distance_chunks.max(1);
 
         for (coord, m) in &self.translucent_meshes {
-            if (coord.x - pcx).abs() > max_d || (coord.z - pcz).abs() > max_d {
+            if !m.has_water
+                || m.index_count == 0
+                || (coord.x - pcx).abs() > max_d
+                || (coord.z - pcz).abs() > max_d
+            {
                 continue;
             }
             pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));

@@ -25,6 +25,8 @@ use crate::voxel::chunk::{
 pub const MAX_FLUID_LEVEL: u8 = 8;
 /// Fluids update once every 4 logic ticks (5 updates/sec at 20 TPS).
 pub const FLUID_TICK_INTERVAL: u32 = 4;
+/// Maximum number of fluid cells processed in a single simulation tick to prevent queue avalanches.
+pub const MAX_FLUID_UPDATES_PER_TICK: usize = 4096;
 /// Radius (in blocks) within which water searches for a downhill ledge/drop-off.
 const SLOPE_SEARCH_RADIUS: i32 = 4;
 
@@ -187,20 +189,26 @@ impl FluidSimulator {
 
     /// Searches up to `SLOPE_SEARCH_RADIUS` (4) blocks horizontally from `pos + first_dir`
     /// to find the shortest distance (`1..=4`) to a ledge/drop-off where the block below
-    /// `(p - Y)` is not solid.
-    fn distance_to_dropoff<F: Fn(IVec3) -> BlockId>(
+    /// `(p - Y)` is not solid. Returns `None` if an unloaded chunk boundary is reached.
+    fn distance_to_dropoff<F: Fn(IVec3) -> Option<BlockId>>(
         pos: IVec3,
         first_dir: IVec3,
         kind: BlockId,
-        get_block: &F,
+        get_block_opt: &F,
     ) -> Option<i32> {
         let can_pass = |p: IVec3| -> bool {
-            let b = get_block(p);
-            b == AIR || b == FIRE || b == kind
+            if let Some(b) = get_block_opt(p) {
+                b == AIR || b == FIRE || b == kind
+            } else {
+                false
+            }
         };
         let is_dropoff = |p: IVec3| -> bool {
-            let below = get_block(p - IVec3::Y);
-            !is_solid_block(below)
+            if let Some(below) = get_block_opt(p - IVec3::Y) {
+                !is_solid_block(below)
+            } else {
+                false
+            }
         };
 
         let start = pos + first_dir;
@@ -241,14 +249,25 @@ impl FluidSimulator {
     }
 
     /// Advances the fluid cellular automaton once every `FLUID_TICK_INTERVAL` (4) logic ticks.
-    /// Processes only the currently queued coordinates from `self.queue`.
-    pub fn tick<F: Fn(IVec3) -> BlockId>(&mut self, get_block: F) -> Vec<(IVec3, BlockId)> {
+    /// Processes up to `MAX_FLUID_UPDATES_PER_TICK` queued coordinates from `self.queue`.
+    pub fn tick<F: Fn(IVec3) -> Option<BlockId>>(
+        &mut self,
+        get_block_opt: F,
+    ) -> Vec<(IVec3, BlockId)> {
         self.tick_counter = self.tick_counter.wrapping_add(1);
         if self.tick_counter % FLUID_TICK_INTERVAL != 0 || self.queue.is_empty() {
             return Vec::new();
         }
 
-        let batch_len = self.queue.len();
+        if self.queue.len() > MAX_FLUID_UPDATES_PER_TICK {
+            log::warn!(
+                "[Fluid] Queue length {} exceeded MAX_FLUID_UPDATES_PER_TICK ({}); throttling tick",
+                self.queue.len(),
+                MAX_FLUID_UPDATES_PER_TICK
+            );
+        }
+
+        let batch_len = self.queue.len().min(MAX_FLUID_UPDATES_PER_TICK);
         let mut active = Vec::with_capacity(batch_len);
         for _ in 0..batch_len {
             if let Some(pos) = self.queue.pop_front() {
@@ -269,8 +288,29 @@ impl FluidSimulator {
             let Some(mut cell) = self.cells.get(&pos).copied() else {
                 continue;
             };
-            let world_id = get_block(pos);
+            if cell.level == 0 || cell.level > MAX_FLUID_LEVEL {
+                log::warn!(
+                    "[Fluid] Invalid fluid level {} at {:?}; clamping to 1..={}",
+                    cell.level,
+                    pos,
+                    MAX_FLUID_LEVEL
+                );
+                cell.level = cell.level.clamp(1, MAX_FLUID_LEVEL);
+            }
+            let Some(world_id) = get_block_opt(pos) else {
+                log::warn!(
+                    "[Fluid] Skipping fluid cell at {:?}: chunk not loaded",
+                    pos
+                );
+                continue;
+            };
             if world_id != cell.kind {
+                log::warn!(
+                    "[Fluid] Desync at {:?}: expected fluid {}, found block {}; removing cell",
+                    pos,
+                    cell.kind,
+                    world_id
+                );
                 self.cells.remove(&pos);
                 continue;
             }
@@ -283,7 +323,9 @@ impl FluidSimulator {
                     if crystallized.contains(&np) {
                         continue;
                     }
-                    let nb = get_block(np);
+                    let Some(nb) = get_block_opt(np) else {
+                        continue;
+                    };
                     if cell.kind == WATER && nb == LAVA {
                         let is_src = self.cells.get(&np).map(|c| c.is_source).unwrap_or(true);
                         let stone_id = if is_src { OBSIDIAN } else { COBBLESTONE };
@@ -336,20 +378,8 @@ impl FluidSimulator {
             if pos.y > 1 {
                 let below = pos - IVec3::Y;
                 if !crystallized.contains(&below) {
-                    let b_below = get_block(below);
-                    if b_below == AIR || b_below == FIRE {
-                        next_cells.push((
-                            below,
-                            FluidCell {
-                                kind: cell.kind,
-                                level: MAX_FLUID_LEVEL,
-                                is_source: false,
-                            },
-                        ));
-                        continue;
-                    } else if b_below == cell.kind {
-                        let below_lvl = self.cells.get(&below).map(|c| c.level).unwrap_or(0);
-                        if below_lvl < MAX_FLUID_LEVEL {
+                    if let Some(b_below) = get_block_opt(below) {
+                        if b_below == AIR || b_below == FIRE {
                             next_cells.push((
                                 below,
                                 FluidCell {
@@ -358,22 +388,35 @@ impl FluidSimulator {
                                     is_source: false,
                                 },
                             ));
+                            continue;
+                        } else if b_below == cell.kind {
+                            let below_lvl = self.cells.get(&below).map(|c| c.level).unwrap_or(0);
+                            if below_lvl < MAX_FLUID_LEVEL {
+                                next_cells.push((
+                                    below,
+                                    FluidCell {
+                                        kind: cell.kind,
+                                        level: MAX_FLUID_LEVEL,
+                                        is_source: false,
+                                    },
+                                ));
+                            }
+                            // Falling into a pool of the same fluid below: do not spread sideways mid-air.
+                            continue;
+                        } else if (cell.kind == WATER && b_below == LAVA)
+                            || (cell.kind == LAVA && b_below == WATER)
+                        {
+                            let target_lava = if b_below == LAVA { below } else { pos };
+                            let is_src = self
+                                .cells
+                                .get(&target_lava)
+                                .map(|c| c.is_source)
+                                .unwrap_or(true);
+                            let stone_id = if is_src { OBSIDIAN } else { COBBLESTONE };
+                            crystallized.insert(target_lava);
+                            block_edits.push((target_lava, stone_id));
+                            continue;
                         }
-                        // Falling into a pool of the same fluid below: do not spread sideways mid-air.
-                        continue;
-                    } else if (cell.kind == WATER && b_below == LAVA)
-                        || (cell.kind == LAVA && b_below == WATER)
-                    {
-                        let target_lava = if b_below == LAVA { below } else { pos };
-                        let is_src = self
-                            .cells
-                            .get(&target_lava)
-                            .map(|c| c.is_source)
-                            .unwrap_or(true);
-                        let stone_id = if is_src { OBSIDIAN } else { COBBLESTONE };
-                        crystallized.insert(target_lava);
-                        block_edits.push((target_lava, stone_id));
-                        continue;
                     }
                 }
             }
@@ -383,7 +426,9 @@ impl FluidSimulator {
             //    more directions reach a drop-off within 4 blocks, direct the flow ONLY along the
             //    direction(s) with the shortest distance to the drop-off!
             let below = pos - IVec3::Y;
-            let b_below = get_block(below);
+            let Some(b_below) = get_block_opt(below) else {
+                continue;
+            };
             if !is_solid_block(b_below) || cell.level <= 1 {
                 continue;
             }
@@ -400,7 +445,7 @@ impl FluidSimulator {
             let mut dir_distances: [Option<i32>; 4] = [None; 4];
             let mut min_drop_dist: Option<i32> = None;
             for (i, &d) in HORIZONTAL_DIRS.iter().enumerate() {
-                if let Some(dist) = Self::distance_to_dropoff(pos, d, cell.kind, &get_block) {
+                if let Some(dist) = Self::distance_to_dropoff(pos, d, cell.kind, &get_block_opt) {
                     dir_distances[i] = Some(dist);
                     min_drop_dist = Some(match min_drop_dist {
                         Some(cur_min) => cur_min.min(dist),
@@ -414,7 +459,9 @@ impl FluidSimulator {
                 if crystallized.contains(&np) {
                     continue;
                 }
-                let nb = get_block(np);
+                let Some(nb) = get_block_opt(np) else {
+                    continue;
+                };
 
                 // Always allow immediate Water+Lava crystallization with adjacent neighbors
                 if (cell.kind == WATER && nb == LAVA) || (cell.kind == LAVA && nb == WATER) {
@@ -498,7 +545,7 @@ mod tests {
 
     fn step_fluid_once(sim: &mut FluidSimulator, world_map: &mut HashMap<IVec3, BlockId>) {
         for _ in 0..FLUID_TICK_INTERVAL {
-            let edits = sim.tick(|p| *world_map.get(&p).unwrap_or(&AIR));
+            let edits = sim.tick(|p| Some(*world_map.get(&p).unwrap_or(&AIR)));
             for (p, id) in edits {
                 if id == AIR {
                     world_map.remove(&p);
@@ -600,5 +647,37 @@ mod tests {
         assert_eq!(world_map.get(&IVec3::new(0, 4, 1)), None);
         assert_eq!(world_map.get(&IVec3::new(0, 4, -1)), None);
         assert_eq!(world_map.get(&IVec3::new(-1, 4, 0)), None);
+    }
+
+    #[test]
+    fn unloaded_chunk_boundary_and_queue_limit_do_not_panic() {
+        let mut sim = FluidSimulator::new();
+        let mut world_map: HashMap<IVec3, BlockId> = HashMap::new();
+        let src = IVec3::new(31, 4, 31);
+        world_map.insert(src, WATER);
+        world_map.insert(IVec3::new(31, 3, 31), STONE);
+        sim.on_block_changed(src, WATER);
+        // Duplicate enqueues of the same coordinate must not duplicate queue entries.
+        sim.on_block_changed(src, WATER);
+        assert_eq!(sim.queue.len(), 1);
+
+        // Simulate unloaded neighbor chunks at x >= 32 or z >= 32 by returning None.
+        for _ in 0..FLUID_TICK_INTERVAL {
+            let edits = sim.tick(|p| {
+                if p.x >= 32 || p.z >= 32 {
+                    None
+                } else {
+                    Some(*world_map.get(&p).unwrap_or(&AIR))
+                }
+            });
+            for (p, id) in edits {
+                assert!(p.x < 32 && p.z < 32);
+                if id == AIR {
+                    world_map.remove(&p);
+                } else {
+                    world_map.insert(p, id);
+                }
+            }
+        }
     }
 }

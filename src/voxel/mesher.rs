@@ -888,4 +888,45 @@ mod tests {
         );
         assert_eq!(mesh.vertices.len(), 8);
     }
+
+    #[test]
+    fn water_at_all_chunk_corners_and_borders_meshes_without_panic() {
+        let n = CHUNK_SIZE as i32;
+        let pad = n + 4;
+        let pad_u = pad as usize;
+        let mut cells = vec![AIR; pad_u * pad_u * pad_u];
+
+        // Place water at every extreme corner/border of the chunk (0, 31) including y=0 and y=31.
+        let water_coords = [
+            (0, 0, 0),
+            (31, 0, 0),
+            (0, 0, 31),
+            (31, 0, 31),
+            (0, 31, 0),
+            (31, 31, 31),
+        ];
+        for (x, y, z) in water_coords {
+            let idx = (x + 2) as usize
+                + (y + 2) as usize * pad_u
+                + (z + 2) as usize * pad_u * pad_u;
+            cells[idx] = with_fluid_level(WATER, 8);
+        }
+
+        let mesh = mesh_chunk(
+            IVec3::ZERO,
+            |x, y, z| {
+                let (Some(ix), Some(iy), Some(iz)) = (
+                    usize::try_from(x + 2).ok().filter(|&v| v < pad_u),
+                    usize::try_from(y + 2).ok().filter(|&v| v < pad_u),
+                    usize::try_from(z + 2).ok().filter(|&v| v < pad_u),
+                ) else {
+                    return AIR;
+                };
+                cells.get(ix + iy * pad_u + iz * pad_u * pad_u).copied().unwrap_or(AIR)
+            },
+            |_x, _y, _z| 0,
+        );
+        assert!(!mesh.translucent.vertices.is_empty());
+        assert!(!mesh.translucent.indices.is_empty());
+    }
 }
