@@ -133,15 +133,16 @@ where
     let n = CHUNK_SIZE as i32;
     let mut opaque = MeshData::new();
     let mut translucent = MeshData::new();
-    let mut mask = vec![(AIR, 0u16, [3u8; 4], 0u8); size * size];
+    let mut mask = vec![(AIR, 0u16, [3u8; 4], 0u8, NO_TEXTURE); size * size];
 
-    // ── Pass 1: Greedy meshing of opaque full-cube voxels with Corner AO & Top UV Rotation ──
+    // ── Pass 1: Greedy meshing of opaque full-cube voxels with Corner AO, Better Grass & Top UV Rotation ──
     for d in 0..3usize {
         let u = (d + 1) % 3;
         let v = (d + 2) % 3;
 
         for positive in [true, false] {
             let step = if positive { 1 } else { -1 };
+            let face = BlockFace::from_axis(d, positive);
 
             for slice in 0..n {
                 for j in 0..n {
@@ -174,14 +175,26 @@ where
                             } else {
                                 0
                             };
-                            mask[(j * n + k) as usize] = (b, fl, ao, rot);
+
+                            // Better Grass: if a vertical side face of a Grass block steps down 1 block
+                            // onto another Grass block (`(x + dir.x, y - 1, z + dir.z) == GRASS`),
+                            // use `GrassTop` instead of `GrassSide` for continuous green hillsides.
+                            let mut tex_layer = get_face_texture(b, face, is_active_block(b));
+                            if d != 1 && base_block_id(b) == GRASS {
+                                let step_down = sample(q[0], q[1] - 1, q[2]);
+                                if base_block_id(step_down) == GRASS {
+                                    tex_layer = TextureLayer::GrassTop as u32;
+                                }
+                            }
+
+                            mask[(j * n + k) as usize] = (b, fl, ao, rot, tex_layer);
                         } else {
-                            mask[(j * n + k) as usize] = (AIR, 0, [3; 4], 0);
+                            mask[(j * n + k) as usize] = (AIR, 0, [3; 4], 0, NO_TEXTURE);
                         }
                     }
                 }
 
-                // Greedy merge faces with identical (BlockId, LightData, CornerAO, TopUVRot).
+                // Greedy merge faces with identical (BlockId, LightData, CornerAO, TopUVRot, TexLayer).
                 for j in 0..size {
                     let mut k = 0;
                     while k < size {
@@ -206,7 +219,7 @@ where
                         }
                         for dy in 0..h {
                             for dx in 0..w {
-                                mask[(j + dy) * size + k + dx] = (AIR, 0, [3; 4], 0);
+                                mask[(j + dy) * size + k + dx] = (AIR, 0, [3; 4], 0, NO_TEXTURE);
                             }
                         }
 
@@ -226,6 +239,7 @@ where
                             light_to_f32_array(cell.1),
                             cell.2,
                             cell.3,
+                            cell.4,
                         );
                         k += w;
                     }
@@ -293,6 +307,7 @@ fn emit_quad(
     light: [f32; 4],
     ao: [u8; 4],
     top_rot: u8,
+    tex_layer: u32,
 ) {
     let plane = slice + if positive { 1 } else { 0 };
     let (k, j, w, h) = (k as i32, j as i32, w as i32, h as i32);
@@ -301,7 +316,6 @@ fn emit_quad(
     normal[d] = if positive { 1.0 } else { -1.0 };
     let face = BlockFace::from_axis(d, positive);
     let active = is_active_block(block);
-    let tex_layer = get_face_texture(block, face, active);
     let color = if tex_layer != NO_TEXTURE {
         texture_tint_color(block, d)
     } else {
@@ -1062,5 +1076,43 @@ mod tests {
         );
         assert!(!mesh.translucent.vertices.is_empty());
         assert!(!mesh.translucent.indices.is_empty());
+    }
+
+    #[test]
+    fn better_grass_uses_grass_top_on_1_block_step_and_grass_side_on_cliffs() {
+        // Grass block at (5, 5, 5):
+        //   +X step-down (6, 4, 5) = GRASS -> +X face must use GrassTop (2)
+        //   -X step-down (4, 4, 5) = AIR   -> -X face must use GrassSide (3)
+        let mesh = mesh_chunk(
+            IVec3::ZERO,
+            |x, y, z| {
+                if (x, y, z) == (5, 5, 5) || (x, y, z) == (6, 4, 5) {
+                    GRASS
+                } else {
+                    AIR
+                }
+            },
+            |_x, _y, _z| 15,
+        );
+
+        let px_layers: Vec<u32> = mesh
+            .opaque
+            .vertices
+            .iter()
+            .filter(|v| v.normal[0] > 0.5 && (v.position[0] - 6.0).abs() < 0.01)
+            .map(|v| v.tex_layer)
+            .collect();
+        let nx_layers: Vec<u32> = mesh
+            .opaque
+            .vertices
+            .iter()
+            .filter(|v| v.normal[0] < -0.5 && (v.position[0] - 5.0).abs() < 0.01)
+            .map(|v| v.tex_layer)
+            .collect();
+
+        assert!(!px_layers.is_empty());
+        assert!(px_layers.iter().all(|&l| l == TextureLayer::GrassTop as u32));
+        assert!(!nx_layers.is_empty());
+        assert!(nx_layers.iter().all(|&l| l == TextureLayer::GrassSide as u32));
     }
 }
