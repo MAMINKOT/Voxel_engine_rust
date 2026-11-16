@@ -208,9 +208,22 @@ fn shade_voxel(in: VertexOutput) -> vec4<f32> {
         sampled_layer = 52u + ((global_ticks / 4u) % 32u);
     }
 
+    // World-Aligned UV for Greedy-Meshed blocks (`in.uv.x < -0.5`) so every 1x1x1 voxel
+    // gets a crisp unstretched 16x16 square tile regardless of Greedy Quad size.
+    var uv = in.uv;
+    if in.uv.x < -0.5 {
+        if abs(in.normal.y) > 0.5 {
+            uv = in.world_pos.xz;
+        } else if abs(in.normal.x) > 0.5 {
+            uv = vec2<f32>(in.world_pos.z, -in.world_pos.y);
+        } else {
+            uv = vec2<f32>(in.world_pos.x, -in.world_pos.y);
+        }
+    }
+
     // Sample unconditionally in uniform control flow, then apply if `tex_layer != 0xFFFFFFFFu`
     let safe_layer = min(sampled_layer, 83u);
-    let tex_color = textureSample(t_diffuse, s_diffuse, in.uv, i32(safe_layer));
+    let tex_color = textureSample(t_diffuse, s_diffuse, uv, i32(safe_layer));
     let has_texture = in.tex_layer != 0xFFFFFFFFu;
 
     if has_texture && tex_color.a < 0.1 {

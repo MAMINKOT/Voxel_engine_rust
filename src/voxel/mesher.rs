@@ -12,8 +12,7 @@ use crate::voxel::blocks::{
 use crate::voxel::chunk::{
     base_block_id, block_face_color, fluid_level_from_id, is_active_block, is_energy_connectable,
     is_fluid, is_full_cube, is_solid_block, is_translucent, BlockId, AIR, CABLE, CABLE_MAX,
-    CABLE_MIN, CHUNK_SIZE, COBBLESTONE, DIRT, FIRE, GRASS, LAVA, OAK_LEAVES,
-    PURPLE_STAINED_GLASS, STONE, TORCH, WATER,
+    CABLE_MIN, CHUNK_SIZE, FIRE, GRASS, LAVA, OAK_LEAVES, PURPLE_STAINED_GLASS, TORCH, WATER,
 };
 use crate::voxel::light::{
     blue_channel, green_channel, light_to_f32_array, pack_light, red_channel, sun_channel,
@@ -112,17 +111,6 @@ fn compute_face_ao<F: Fn(i32, i32, i32) -> BlockId>(
     ]
 }
 
-/// Deterministic pseudo-random `0..=3` (0°, 90°, 180°, 270°) UV rotation for natural top faces
-/// (`Stone`, `Dirt`, `Grass`, `Cobblestone`) to eliminate repetitive tiling grids.
-#[inline]
-fn top_uv_rotation(wx: i32, wz: i32, block: BlockId) -> u8 {
-    if matches!(base_block_id(block), STONE | DIRT | GRASS | COBBLESTONE) {
-        (((wx.wrapping_mul(374_761_393) ^ wz.wrapping_mul(668_265_263)) >> 8) & 3) as u8
-    } else {
-        0
-    }
-}
-
 /// `sample` and `sample_light` take chunk-local coordinates (may lie in `-2..=33`, i.e. in neighbours).
 pub fn mesh_chunk<F, L>(origin: IVec3, sample: F, sample_light: L) -> ChunkMeshData
 where
@@ -133,9 +121,9 @@ where
     let n = CHUNK_SIZE as i32;
     let mut opaque = MeshData::new();
     let mut translucent = MeshData::new();
-    let mut mask = vec![(AIR, 0u16, [3u8; 4], 0u8, NO_TEXTURE); size * size];
+    let mut mask = vec![(AIR, 0u16, [3u8; 4], NO_TEXTURE); size * size];
 
-    // ── Pass 1: Greedy meshing of opaque full-cube voxels with Corner AO, Better Grass & Top UV Rotation ──
+    // ── Pass 1: Greedy meshing of opaque full-cube voxels with Corner AO & Better Grass ──
     for d in 0..3usize {
         let u = (d + 1) % 3;
         let v = (d + 2) % 3;
@@ -170,11 +158,6 @@ where
                                 );
                             }
                             let ao = compute_face_ao(q, u, v, &sample);
-                            let rot = if d == 1 && positive {
-                                top_uv_rotation(origin.x + p[0], origin.z + p[2], b)
-                            } else {
-                                0
-                            };
 
                             // Better Grass: if a vertical side face of a Grass block steps down 1 block
                             // onto another Grass block (`(x + dir.x, y - 1, z + dir.z) == GRASS`),
@@ -187,14 +170,14 @@ where
                                 }
                             }
 
-                            mask[(j * n + k) as usize] = (b, fl, ao, rot, tex_layer);
+                            mask[(j * n + k) as usize] = (b, fl, ao, tex_layer);
                         } else {
-                            mask[(j * n + k) as usize] = (AIR, 0, [3; 4], 0, NO_TEXTURE);
+                            mask[(j * n + k) as usize] = (AIR, 0, [3; 4], NO_TEXTURE);
                         }
                     }
                 }
 
-                // Greedy merge faces with identical (BlockId, LightData, CornerAO, TopUVRot, TexLayer).
+                // Greedy merge faces with identical (BlockId, LightData, CornerAO, TexLayer).
                 for j in 0..size {
                     let mut k = 0;
                     while k < size {
@@ -219,7 +202,7 @@ where
                         }
                         for dy in 0..h {
                             for dx in 0..w {
-                                mask[(j + dy) * size + k + dx] = (AIR, 0, [3; 4], 0, NO_TEXTURE);
+                                mask[(j + dy) * size + k + dx] = (AIR, 0, [3; 4], NO_TEXTURE);
                             }
                         }
 
@@ -239,7 +222,6 @@ where
                             light_to_f32_array(cell.1),
                             cell.2,
                             cell.3,
-                            cell.4,
                         );
                         k += w;
                     }
@@ -306,7 +288,6 @@ fn emit_quad(
     block: BlockId,
     light: [f32; 4],
     ao: [u8; 4],
-    top_rot: u8,
     tex_layer: u32,
 ) {
     let plane = slice + if positive { 1 } else { 0 };
@@ -327,22 +308,6 @@ fn emit_quad(
         MAT_STANDARD
     };
 
-    let wf = w as f32;
-    let hf = h as f32;
-    let uvs: [[f32; 2]; 4] = match d {
-        // ±X: u = Y (w), v = Z (h) -> keep V upright (-Y) and U horizontal (Z)
-        0 => [[0.0, wf], [0.0, 0.0], [hf, 0.0], [hf, wf]],
-        // ±Y: u = Z (w), v = X (h) with optional 0/90/180/270° top-face rotation
-        1 => match top_rot & 3 {
-            1 => [[0.0, hf], [0.0, 0.0], [wf, 0.0], [wf, hf]],
-            2 => [[wf, hf], [0.0, hf], [0.0, 0.0], [wf, 0.0]],
-            3 => [[wf, 0.0], [wf, hf], [0.0, hf], [0.0, 0.0]],
-            _ => [[0.0, 0.0], [wf, 0.0], [wf, hf], [0.0, hf]],
-        },
-        // ±Z: u = X (w), v = Y (h) -> keep V upright (-Y) and U horizontal (X)
-        _ => [[0.0, hf], [wf, hf], [wf, 0.0], [0.0, 0.0]],
-    };
-
     let base = data.vertices.len() as u32;
     let corners = [(k, j), (k + w, j), (k + w, j + h), (k, j + h)];
     for (idx, (cu, cv)) in corners.into_iter().enumerate() {
@@ -360,7 +325,9 @@ fn emit_quad(
             color,
             light,
             ao_and_flags: [ao[idx] as f32, mat_flag],
-            uv: uvs[idx],
+            // Sentinel `-1.0` tells `voxel.wgsl` to use World-Aligned UV (`world_pos`)
+            // so every 1x1x1 voxel gets a crisp unstretched 16x16 tile regardless of quad size.
+            uv: [-1.0, -1.0],
             tex_layer,
         });
     }
