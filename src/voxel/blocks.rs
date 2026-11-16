@@ -2,10 +2,10 @@
 // and per-face block-to-texture mapping (`get_face_texture`).
 
 use crate::voxel::chunk::{
-    base_block_id, block_color, is_active_block, BlockId, ALLOY_SMELTER, BATBOX, BEDROCK, CABLE,
-    CHEST, COAL_GENERATOR, COAL_ORE, COBBLESTONE, COPPER_ORE, DIRT, ELECTRIC_FURNACE, FIRE,
-    GRASS, IRON_ORE, LAVA, OAK_LEAVES, OBSIDIAN, OIL, PURPLE_STAINED_GLASS, SIMPLE_FURNACE,
-    STONE, TIN_ORE, TNT, TORCH, WATER, WOOD, WORKBENCH,
+    base_block_id, block_color, facing_from_id, is_active_block, BlockId, ALLOY_SMELTER, BATBOX,
+    BEDROCK, CABLE, CHEST, COAL_GENERATOR, COAL_ORE, COBBLESTONE, COPPER_ORE, DIRT,
+    ELECTRIC_FURNACE, FIRE, GRASS, IRON_ORE, LAVA, OAK_LEAVES, OBSIDIAN, OIL,
+    PURPLE_STAINED_GLASS, SIMPLE_FURNACE, STONE, TIN_ORE, TNT, TORCH, WATER, WOOD, WORKBENCH,
 };
 
 /// Sentinel value in `Vertex::tex_layer` indicating an untextured vertex-colored surface
@@ -215,17 +215,28 @@ pub fn block_def(id: BlockId) -> Option<&'static BlockDef> {
     BLOCK_DEFS.iter().find(|d| d.id == base)
 }
 
+#[inline]
+fn front_face_for(facing: u8) -> BlockFace {
+    match facing & 0x03 {
+        0 => BlockFace::NegZ, // North (-Z)
+        1 => BlockFace::PosX, // East (+X)
+        2 => BlockFace::PosZ, // South (+Z)
+        _ => BlockFace::NegX, // West (-X)
+    }
+}
+
 /// Returns the emissive HDR radiance (`0.0` for all normal blocks, `> 0.0` only for
 /// `Lava`, `Torch`, `Fire`, and the glowing front face of active furnaces/generators).
 pub fn block_face_emission(block_id: BlockId, face: BlockFace, is_active: bool) -> f32 {
     let base = base_block_id(block_id);
     let active = is_active || is_active_block(block_id);
+    let front = front_face_for(facing_from_id(block_id));
     match base {
         LAVA => 2.2,
         TORCH => 2.0,
         FIRE => 2.5,
         SIMPLE_FURNACE | COAL_GENERATOR | ELECTRIC_FURNACE | ALLOY_SMELTER => {
-            if active && face == BlockFace::PosZ {
+            if active && face == front {
                 2.4
             } else {
                 0.0
@@ -240,6 +251,7 @@ pub fn block_face_emission(block_id: BlockId, face: BlockFace, is_active: bool) 
 pub fn get_face_texture(block_id: BlockId, face: BlockFace, is_active: bool) -> u32 {
     let base = base_block_id(block_id);
     let active = is_active || is_active_block(block_id);
+    let front = front_face_for(facing_from_id(block_id));
 
     match base {
         GRASS => match face {
@@ -247,23 +259,30 @@ pub fn get_face_texture(block_id: BlockId, face: BlockFace, is_active: bool) -> 
             BlockFace::NegY => TextureLayer::Dirt as u32,
             _ => TextureLayer::GrassSide as u32,
         },
-        WORKBENCH => match face {
-            BlockFace::PosY => TextureLayer::CraftingTableTop as u32,
-            BlockFace::PosZ => TextureLayer::CraftingTableFront as u32,
-            BlockFace::NegY => TextureLayer::LogOakSide as u32,
-            _ => TextureLayer::CraftingTableSide as u32,
-        },
-        SIMPLE_FURNACE | COAL_GENERATOR | ELECTRIC_FURNACE | ALLOY_SMELTER => match face {
-            BlockFace::PosZ => {
+        WORKBENCH => {
+            if face == BlockFace::PosY {
+                TextureLayer::CraftingTableTop as u32
+            } else if face == BlockFace::NegY {
+                TextureLayer::LogOakSide as u32
+            } else if face == front {
+                TextureLayer::CraftingTableFront as u32
+            } else {
+                TextureLayer::CraftingTableSide as u32
+            }
+        }
+        SIMPLE_FURNACE | COAL_GENERATOR | ELECTRIC_FURNACE | ALLOY_SMELTER => {
+            if face == front {
                 if active {
                     TextureLayer::FurnaceFrontOn as u32
                 } else {
                     TextureLayer::FurnaceFrontOff as u32
                 }
+            } else if face == BlockFace::PosY {
+                TextureLayer::FurnaceTop as u32
+            } else {
+                TextureLayer::FurnaceSide as u32
             }
-            BlockFace::PosY => TextureLayer::FurnaceTop as u32,
-            _ => TextureLayer::FurnaceSide as u32,
-        },
+        }
         TNT => match face {
             BlockFace::PosY => TextureLayer::TntTop as u32,
             BlockFace::NegY => TextureLayer::TntBottom as u32,
@@ -336,5 +355,27 @@ mod tests {
         assert!(torch.emission > 0.0);
         let lava = block_def(LAVA).expect("Lava registered");
         assert!(lava.emission > 0.0);
+    }
+
+    #[test]
+    fn facing_rotates_furnace_and_workbench_front_face() {
+        use crate::voxel::chunk::with_facing;
+
+        // Facing 0 = North (-Z), 1 = East (+X), 2 = South (+Z), 3 = West (-X)
+        let f_east = with_facing(SIMPLE_FURNACE, 1);
+        assert_eq!(
+            get_face_texture(f_east, BlockFace::PosX, true),
+            TextureLayer::FurnaceFrontOn as u32
+        );
+        assert_eq!(
+            get_face_texture(f_east, BlockFace::PosZ, true),
+            TextureLayer::FurnaceSide as u32
+        );
+
+        let w_west = with_facing(WORKBENCH, 3);
+        assert_eq!(
+            get_face_texture(w_west, BlockFace::NegX, false),
+            TextureLayer::CraftingTableFront as u32
+        );
     }
 }

@@ -198,13 +198,14 @@ fn sample_sun_shadow(world_pos: vec3<f32>, normal: vec3<f32>, screen_xy: vec2<f3
 
 // ── Shared Textured + RGB + Sunlight + Poisson PCF Shadow + Smooth AO ─────────
 fn shade_voxel(in: VertexOutput) -> vec4<f32> {
-    // Animated Lava (`tex_layer == 28`, 20 frames @ 32..52) & Fire (`tex_layer == 30`, 32 frames @ 52..84)
+    // Animated Lava (`tex_layer == 28`, 20 frames @ 32..52, slow 10-tick interval)
+    // & Fire (`tex_layer == 30`, 32 frames @ 52..84, 4-tick interval)
     let global_ticks = u32(max(camera.cam_pos.w, 0.0) * 20.0);
     var sampled_layer = in.tex_layer;
     if in.tex_layer == 28u {
-        sampled_layer = 32u + ((global_ticks / 3u) % 20u);
+        sampled_layer = 32u + ((global_ticks / 10u) % 20u);
     } else if in.tex_layer == 30u {
-        sampled_layer = 52u + ((global_ticks / 2u) % 32u);
+        sampled_layer = 52u + ((global_ticks / 4u) % 32u);
     }
 
     // Sample unconditionally in uniform control flow, then apply if `tex_layer != 0xFFFFFFFFu`
@@ -262,6 +263,12 @@ fn shade_voxel(in: VertexOutput) -> vec4<f32> {
     let tint_linear = pow(clamp(base_srgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
     var albedo = select(tint_linear, tex_color.rgb * tint_linear, has_texture);
     let alpha = select(1.0, tex_color.a, has_texture);
+
+    // Biome Noise Tint on Grass Top (`tex_layer == 2u`)
+    if in.tex_layer == 2u {
+        let biome_tint = sin(in.world_pos.x * 0.04) * cos(in.world_pos.z * 0.04) * 0.08 + 0.92;
+        albedo = albedo * vec3<f32>(biome_tint * 0.95, biome_tint * 1.05, biome_tint * 0.90);
+    }
 
     // PrimedTNT white flash overlay (`mat_flag == 5.0`)
     if abs(mat_flag - 5.0) < 0.25 {

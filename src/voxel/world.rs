@@ -18,13 +18,13 @@ use wgpu::util::DeviceExt;
 use crate::sim::energy_net::EnergyNetwork;
 use crate::sim::explosions::{ExplosionSystem, TNT_FUSE_TICKS};
 use crate::voxel::chunk::{
-    is_fluid, is_solid_block, with_fluid_level, BlockId, Chunk, ACTIVE_MACHINE_FLAG, AIR, BEDROCK,
-    CHUNK_SIZE, COAL_ORE, COPPER_ORE, DIRT, GRASS, IRON_ORE, OAK_LEAVES, STONE, TIN_ORE, TNT,
-    WOOD,
+    is_fluid, is_solid_block, with_facing, with_fluid_level, BlockId, Chunk, ACTIVE_MACHINE_FLAG,
+    AIR, BEDROCK, CHUNK_SIZE, COAL_ORE, COPPER_ORE, DIRT, GRASS, IRON_ORE, OAK_LEAVES, STONE,
+    TIN_ORE, TNT, WOOD,
 };
 use crate::voxel::drops::{block_center, build_drops_mesh, Drops};
 use crate::voxel::fluid::FluidSimulator;
-use crate::voxel::light::compute_padded_light;
+use crate::voxel::light::compute_padded_light_rect;
 use crate::voxel::mesher::{mesh_chunk, ChunkMeshData, MeshData};
 
 /// Chunks span coordinates `CHUNK_MIN..=CHUNK_MAX` on X and Z (`-8..=7` -> 16×16 = 256 chunks).
@@ -346,7 +346,8 @@ impl World {
         }
 
         if !dirty_positions.is_empty() {
-            self.remesh_positions(device, &dirty_positions);
+            let radius = if had_detonation { 14 } else { 1 };
+            self.remesh_positions_with_radius(device, &dirty_positions, radius);
         }
 
         total_player_impulse
@@ -355,6 +356,18 @@ impl World {
     /// Safe chunk-boundary block lookup returning `None` if the target chunk is not loaded.
     pub fn get_block_opt(&self, p: IVec3) -> Option<BlockId> {
         block_opt_in_chunks(&self.chunks, p)
+    }
+
+    fn get_meta_in_chunks(&self, p: IVec3) -> u8 {
+        let n = CHUNK_SIZE as i32;
+        if p.y < 0 || p.y >= n {
+            return 0;
+        }
+        let coord = IVec3::new(p.x.div_euclid(n), 0, p.z.div_euclid(n));
+        self.chunks
+            .get(&coord)
+            .map(|c| c.get_meta(p.x.rem_euclid(n), p.y.rem_euclid(n), p.z.rem_euclid(n)))
+            .unwrap_or(0)
     }
 
     /// Safe global fluid level lookup (`0.0..=8.0`) across chunk borders.
@@ -421,8 +434,17 @@ impl World {
         true
     }
 
-    /// Rebuilds meshes for all chunks touched by `positions` (including neighbor chunks on borders).
+    /// Rebuilds meshes for all chunks touched by `positions` (including neighbor chunks within `border_radius`).
     fn remesh_positions(&mut self, device: &wgpu::Device, positions: &[IVec3]) {
+        self.remesh_positions_with_radius(device, positions, 14);
+    }
+
+    fn remesh_positions_with_radius(
+        &mut self,
+        device: &wgpu::Device,
+        positions: &[IVec3],
+        border_radius: i32,
+    ) {
         let n = CHUNK_SIZE as i32;
         let mut dirty_set: HashSet<IVec3> = HashSet::new();
         for &p in positions {
@@ -430,6 +452,18 @@ impl World {
             let local = IVec3::new(p.x.rem_euclid(n), p.y.rem_euclid(n), p.z.rem_euclid(n));
             if self.chunks.contains_key(&coord) {
                 dirty_set.insert(coord);
+            }
+            let min_cx = (p.x - border_radius).div_euclid(n);
+            let max_cx = (p.x + border_radius).div_euclid(n);
+            let min_cz = (p.z - border_radius).div_euclid(n);
+            let max_cz = (p.z + border_radius).div_euclid(n);
+            for cz in min_cz..=max_cz {
+                for cx in min_cx..=max_cx {
+                    let c = IVec3::new(cx, coord.y, cz);
+                    if self.chunks.contains_key(&c) {
+                        dirty_set.insert(c);
+                    }
+                }
             }
             for axis in 0..3 {
                 if local[axis] == 0 {
@@ -466,8 +500,25 @@ impl World {
         }
     }
 
+    /// Places or replaces a block with explicit horizontal facing (`0=N, 1=E, 2=S, 3=W`).
+    pub fn set_block_with_facing(
+        &mut self,
+        device: &wgpu::Device,
+        p: IVec3,
+        id: BlockId,
+        facing: u8,
+    ) -> bool {
+        let n = CHUNK_SIZE as i32;
+        let coord = IVec3::new(p.x.div_euclid(n), p.y.div_euclid(n), p.z.div_euclid(n));
+        let local = IVec3::new(p.x.rem_euclid(n), p.y.rem_euclid(n), p.z.rem_euclid(n));
+        if let Some(chunk) = self.chunks.get_mut(&coord) {
+            chunk.set_meta(local.x, local.y, local.z, facing & 0x03);
+        }
+        self.set_block(device, p, id)
+    }
+
     /// Edits one block, notifies the energy/fluid/explosion systems, spawns item drops when
-    /// breaking, and re-meshes the affected chunk (plus neighbours when on a border).
+    /// breaking, and re-meshes the affected chunk (plus neighbours within light radius).
     /// Returns `true` if the block was actually modified.
     pub fn set_block(&mut self, device: &wgpu::Device, p: IVec3, id: BlockId) -> bool {
         let n = CHUNK_SIZE as i32;
@@ -594,58 +645,68 @@ impl World {
     /// Greedy-meshes a chunk into separate opaque and translucent vertex/index buffers.
     fn build_mesh(&self, coord: IVec3) -> ChunkMeshData {
         let n = CHUNK_SIZE as i32;
-        // Pad by 2 voxels on every side (-2..=33) so fluid corner averaging and neighbor
-        // lookups across chunk borders never index out of bounds.
-        let pad = n + 4;
-        let pad_u = pad as usize;
+        // Pad X/Z by 14 voxels (full torch/lava light flood-fill radius across chunk borders)
+        // and Y by 2 voxels so fluid corner averaging and light flood-fill are 100% seamless.
+        let pad_xz = 14i32;
+        let pad_y = 2i32;
+        let px = n + pad_xz * 2;
+        let py = n + pad_y * 2;
+        let pz = n + pad_xz * 2;
+        let px_u = px as usize;
+        let py_u = py as usize;
+        let pz_u = pz as usize;
         let origin = coord * n;
 
-        let mut cells = vec![AIR; pad_u * pad_u * pad_u];
-        for z in 0..pad {
-            for y in 0..pad {
-                for x in 0..pad {
-                    let wp = origin + IVec3::new(x - 2, y - 2, z - 2);
+        let mut cells = vec![AIR; px_u * py_u * pz_u];
+        for z in 0..pz {
+            for y in 0..py {
+                for x in 0..px {
+                    let wp = origin + IVec3::new(x - pad_xz, y - pad_y, z - pad_xz);
                     let mut b = self.get_block_opt(wp).unwrap_or(AIR);
                     if b != AIR {
                         if is_fluid(b) {
                             let lvl =
                                 (self.get_fluid_level_clamped(wp.x, wp.y, wp.z) as u8).clamp(1, 8);
                             b = with_fluid_level(b, lvl);
-                        } else if self.energy.is_machine_active(wp) {
-                            b |= ACTIVE_MACHINE_FLAG;
+                        } else {
+                            let facing = self.get_meta_in_chunks(wp);
+                            b = with_facing(b, facing);
+                            if self.energy.is_machine_active(wp) {
+                                b |= ACTIVE_MACHINE_FLAG;
+                            }
                         }
                     }
-                    let idx = (x as usize) + (y as usize) * pad_u + (z as usize) * pad_u * pad_u;
+                    let idx = (x as usize) + (y as usize) * px_u + (z as usize) * px_u * py_u;
                     cells[idx] = b;
                 }
             }
         }
 
-        let lights = compute_padded_light(&cells, pad);
+        let lights = compute_padded_light_rect(&cells, px, py, pz);
 
         mesh_chunk(
             origin,
             |x, y, z| {
                 let (Some(ix), Some(iy), Some(iz)) = (
-                    usize::try_from(x + 2).ok().filter(|&v| v < pad_u),
-                    usize::try_from(y + 2).ok().filter(|&v| v < pad_u),
-                    usize::try_from(z + 2).ok().filter(|&v| v < pad_u),
+                    usize::try_from(x + pad_xz).ok().filter(|&v| v < px_u),
+                    usize::try_from(y + pad_y).ok().filter(|&v| v < py_u),
+                    usize::try_from(z + pad_xz).ok().filter(|&v| v < pz_u),
                 ) else {
                     let wp = origin + IVec3::new(x, y, z);
                     return self.get_block_opt(wp).unwrap_or(AIR);
                 };
-                let idx = ix + iy * pad_u + iz * pad_u * pad_u;
+                let idx = ix + iy * px_u + iz * px_u * py_u;
                 cells.get(idx).copied().unwrap_or(AIR)
             },
             |x, y, z| {
                 let (Some(ix), Some(iy), Some(iz)) = (
-                    usize::try_from(x + 2).ok().filter(|&v| v < pad_u),
-                    usize::try_from(y + 2).ok().filter(|&v| v < pad_u),
-                    usize::try_from(z + 2).ok().filter(|&v| v < pad_u),
+                    usize::try_from(x + pad_xz).ok().filter(|&v| v < px_u),
+                    usize::try_from(y + pad_y).ok().filter(|&v| v < py_u),
+                    usize::try_from(z + pad_xz).ok().filter(|&v| v < pz_u),
                 ) else {
                     return 0;
                 };
-                let idx = ix + iy * pad_u + iz * pad_u * pad_u;
+                let idx = ix + iy * px_u + iz * px_u * py_u;
                 lights.get(idx).copied().unwrap_or(0)
             },
         )

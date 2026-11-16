@@ -83,7 +83,7 @@ pub const ALL_ITEMS: [BlockId; 33] = [
 /// High bit used in mesher snapshots to mark a machine block that is currently active/lit.
 pub const ACTIVE_MACHINE_FLAG: BlockId = 0x8000;
 
-/// Extracts the base block/item ID (`0..=255`), stripping fluid level bits and active flags.
+/// Extracts the base block/item ID (`0..=255`), stripping fluid level, facing, and active flags.
 #[inline]
 pub fn base_block_id(id: BlockId) -> BlockId {
     id & 0x00FF
@@ -92,6 +92,19 @@ pub fn base_block_id(id: BlockId) -> BlockId {
 #[inline]
 pub fn is_active_block(id: BlockId) -> bool {
     (id & ACTIVE_MACHINE_FLAG) != 0
+}
+
+/// Packs a horizontal facing (`0 = North (-Z), 1 = East (+X), 2 = South (+Z), 3 = West (-X)`)
+/// into bits `12..=13` of a snapshot `BlockId`.
+#[inline]
+pub fn with_facing(id: BlockId, facing: u8) -> BlockId {
+    (id & !0x3000) | (((facing & 0x03) as u16) << 12)
+}
+
+/// Reads the horizontal facing (`0..=3`) from a snapshot `BlockId`.
+#[inline]
+pub fn facing_from_id(id: BlockId) -> u8 {
+    ((id >> 12) & 0x03) as u8
 }
 
 /// Packs a fluid decay level (`1..=8`) into bits `8..=11` of a snapshot `BlockId`.
@@ -350,6 +363,8 @@ pub fn block_face_color(raw_id: BlockId, axis: usize) -> [f32; 3] {
 
 pub struct Chunk {
     blocks: Box<[BlockId; CHUNK_VOLUME]>,
+    /// Per-voxel metadata (`0..=3` in lower 2 bits = Facing: 0=North(-Z), 1=East(+X), 2=South(+Z), 3=West(-X)).
+    metadata: Box<[u8; CHUNK_VOLUME]>,
 }
 
 impl Chunk {
@@ -359,7 +374,11 @@ impl Chunk {
             .into_boxed_slice()
             .try_into()
             .expect("chunk size mismatch");
-        Self { blocks }
+        let metadata: Box<[u8; CHUNK_VOLUME]> = vec![0u8; CHUNK_VOLUME]
+            .into_boxed_slice()
+            .try_into()
+            .expect("chunk metadata size mismatch");
+        Self { blocks, metadata }
     }
 
     #[inline]
@@ -386,6 +405,22 @@ impl Chunk {
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, id: BlockId) {
         if Self::in_bounds(x, y, z) {
             self.blocks[Self::index(x as usize, y as usize, z as usize)] = id;
+        }
+    }
+
+    /// Returns `0` for out-of-bounds coordinates.
+    pub fn get_meta(&self, x: i32, y: i32, z: i32) -> u8 {
+        if Self::in_bounds(x, y, z) {
+            self.metadata[Self::index(x as usize, y as usize, z as usize)]
+        } else {
+            0
+        }
+    }
+
+    /// Out-of-bounds writes are ignored.
+    pub fn set_meta(&mut self, x: i32, y: i32, z: i32, meta: u8) {
+        if Self::in_bounds(x, y, z) {
+            self.metadata[Self::index(x as usize, y as usize, z as usize)] = meta;
         }
     }
 }

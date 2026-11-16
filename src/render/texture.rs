@@ -234,19 +234,32 @@ pub fn downsample_2x2_rgba(src: &RgbaImage) -> RgbaImage {
     })
 }
 
-/// Loads all `16x16` frames from a vertical spritesheet (`expected_frames` frames).
+/// Loads all square (`width x width`) frames from a vertical animation spritesheet
+/// (e.g. `lava_still.png` 64x1280 = 20 frames, `fire_layer_0.png` 32x1024 = 32 frames)
+/// and normalizes each frame to `16x16` RGBA.
 fn load_spritesheet_frames(path: &Path, expected_frames: u32) -> Vec<RgbaImage> {
     let Ok(img) = image::open(path) else {
+        log::warn!(
+            "Failed to load animated spritesheet {} (using fallback)",
+            path.display()
+        );
         return vec![fallback_checkerboard(); expected_frames as usize];
     };
     let (w, h) = img.dimensions();
-    let frame_count = (h / TEX_SIZE).max(1);
+    let frame_size = w.max(1);
+    let total_frames = (h / frame_size).max(1);
     let mut frames = Vec::with_capacity(expected_frames as usize);
     for i in 0..expected_frames {
-        let src_idx = i % frame_count;
-        let y_off = src_idx * TEX_SIZE;
-        let cropped = if w >= TEX_SIZE && y_off + TEX_SIZE <= h {
-            img.crop_imm(0, y_off, TEX_SIZE, TEX_SIZE).to_rgba8()
+        let src_idx = i % total_frames;
+        let y_off = src_idx * frame_size;
+        let cropped = if y_off + frame_size <= h {
+            let sub = img.crop_imm(0, y_off, frame_size, frame_size);
+            if frame_size == TEX_SIZE {
+                sub.to_rgba8()
+            } else {
+                sub.resize_exact(TEX_SIZE, TEX_SIZE, FilterType::Nearest)
+                    .to_rgba8()
+            }
         } else {
             normalize_to_16x16(img.clone())
         };

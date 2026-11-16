@@ -87,20 +87,32 @@ pub fn block_emission(raw: BlockId) -> Option<(u8, u8, u8)> {
 ///   3. **6-Neighbor BFS Flood-Fill:** Propagates both Sunlight and RGB channels through non-opaque
 ///      voxels (`!is_full_cube`), decrementing by `1` per step, and applying an 80% Green-channel
 ///      attenuation (`g / 5`) whenever light traverses `PURPLE_STAINED_GLASS`.
+#[allow(dead_code)]
 pub fn compute_padded_light(cells: &[BlockId], pad: i32) -> Vec<LightData> {
-    let total = (pad * pad * pad) as usize;
+    compute_padded_light_rect(cells, pad, pad, pad)
+}
+
+/// Computes padded per-voxel lighting across a rectangular `(pad_x, pad_y, pad_z)` neighborhood
+/// so torches, lava, fire, and sunlight propagate seamlessly across 32x32 chunk borders.
+pub fn compute_padded_light_rect(
+    cells: &[BlockId],
+    pad_x: i32,
+    pad_y: i32,
+    pad_z: i32,
+) -> Vec<LightData> {
+    let total = (pad_x * pad_y * pad_z) as usize;
     let mut light = vec![0u16; total];
     let mut queue: VecDeque<(i32, i32, i32)> = VecDeque::with_capacity(4096);
 
-    let idx = |x: i32, y: i32, z: i32| -> usize { (x + y * pad + z * pad * pad) as usize };
+    let idx = |x: i32, y: i32, z: i32| -> usize { (x + y * pad_x + z * pad_x * pad_y) as usize };
 
-    // 1. Vertical Sunlight rays from top of volume (`y = pad - 1` down to `0`)
-    for z in 0..pad {
-        for x in 0..pad {
+    // 1. Vertical Sunlight rays from top of volume (`y = pad_y - 1` down to `0`)
+    for z in 0..pad_z {
+        for x in 0..pad_x {
             let mut sun: u8 = 15;
             let mut purple_beam: u8 = 0;
 
-            for y in (0..pad).rev() {
+            for y in (0..pad_y).rev() {
                 let raw = cells[idx(x, y, z)];
                 let base = base_block_id(raw);
 
@@ -148,9 +160,9 @@ pub fn compute_padded_light(cells: &[BlockId], pad: i32) -> Vec<LightData> {
     }
 
     // 2. Seed artificial RGB light sources (Torches, Lava, Fire, Active Machines)
-    for z in 0..pad {
-        for y in 0..pad {
-            for x in 0..pad {
+    for z in 0..pad_z {
+        for y in 0..pad_y {
+            for x in 0..pad_x {
                 let raw = cells[idx(x, y, z)];
                 if let Some((er, eg, eb)) = block_emission(raw) {
                     let i = idx(x, y, z);
@@ -190,7 +202,7 @@ pub fn compute_padded_light(cells: &[BlockId], pad: i32) -> Vec<LightData> {
             let nx = x + dx;
             let ny = y + dy;
             let nz = z + dz;
-            if nx < 0 || nx >= pad || ny < 0 || ny >= pad || nz < 0 || nz >= pad {
+            if nx < 0 || nx >= pad_x || ny < 0 || ny >= pad_y || nz < 0 || nz >= pad_z {
                 continue;
             }
 

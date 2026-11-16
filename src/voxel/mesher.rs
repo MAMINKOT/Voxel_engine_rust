@@ -12,7 +12,8 @@ use crate::voxel::blocks::{
 use crate::voxel::chunk::{
     base_block_id, block_face_color, fluid_level_from_id, is_active_block, is_energy_connectable,
     is_fluid, is_full_cube, is_solid_block, is_translucent, BlockId, AIR, CABLE, CABLE_MAX,
-    CABLE_MIN, CHUNK_SIZE, FIRE, LAVA, OAK_LEAVES, PURPLE_STAINED_GLASS, TORCH, WATER,
+    CABLE_MIN, CHUNK_SIZE, COBBLESTONE, DIRT, FIRE, GRASS, LAVA, OAK_LEAVES,
+    PURPLE_STAINED_GLASS, STONE, TORCH, WATER,
 };
 use crate::voxel::light::{
     blue_channel, green_channel, light_to_f32_array, pack_light, red_channel, sun_channel,
@@ -111,7 +112,18 @@ fn compute_face_ao<F: Fn(i32, i32, i32) -> BlockId>(
     ]
 }
 
-/// `sample` and `sample_light` take chunk-local coordinates (may lie in `-1..=32`, i.e. in neighbours).
+/// Deterministic pseudo-random `0..=3` (0°, 90°, 180°, 270°) UV rotation for natural top faces
+/// (`Stone`, `Dirt`, `Grass`, `Cobblestone`) to eliminate repetitive tiling grids.
+#[inline]
+fn top_uv_rotation(wx: i32, wz: i32, block: BlockId) -> u8 {
+    if matches!(base_block_id(block), STONE | DIRT | GRASS | COBBLESTONE) {
+        (((wx.wrapping_mul(374_761_393) ^ wz.wrapping_mul(668_265_263)) >> 8) & 3) as u8
+    } else {
+        0
+    }
+}
+
+/// `sample` and `sample_light` take chunk-local coordinates (may lie in `-2..=33`, i.e. in neighbours).
 pub fn mesh_chunk<F, L>(origin: IVec3, sample: F, sample_light: L) -> ChunkMeshData
 where
     F: Fn(i32, i32, i32) -> BlockId,
@@ -121,9 +133,9 @@ where
     let n = CHUNK_SIZE as i32;
     let mut opaque = MeshData::new();
     let mut translucent = MeshData::new();
-    let mut mask = vec![(AIR, 0u16, [3u8; 4]); size * size];
+    let mut mask = vec![(AIR, 0u16, [3u8; 4], 0u8); size * size];
 
-    // ── Pass 1: Greedy meshing of opaque full-cube voxels with Corner AO ──
+    // ── Pass 1: Greedy meshing of opaque full-cube voxels with Corner AO & Top UV Rotation ──
     for d in 0..3usize {
         let u = (d + 1) % 3;
         let v = (d + 2) % 3;
@@ -157,14 +169,19 @@ where
                                 );
                             }
                             let ao = compute_face_ao(q, u, v, &sample);
-                            mask[(j * n + k) as usize] = (b, fl, ao);
+                            let rot = if d == 1 && positive {
+                                top_uv_rotation(origin.x + p[0], origin.z + p[2], b)
+                            } else {
+                                0
+                            };
+                            mask[(j * n + k) as usize] = (b, fl, ao, rot);
                         } else {
-                            mask[(j * n + k) as usize] = (AIR, 0, [3; 4]);
+                            mask[(j * n + k) as usize] = (AIR, 0, [3; 4], 0);
                         }
                     }
                 }
 
-                // Greedy merge faces with identical (BlockId, LightData, CornerAO).
+                // Greedy merge faces with identical (BlockId, LightData, CornerAO, TopUVRot).
                 for j in 0..size {
                     let mut k = 0;
                     while k < size {
@@ -189,7 +206,7 @@ where
                         }
                         for dy in 0..h {
                             for dx in 0..w {
-                                mask[(j + dy) * size + k + dx] = (AIR, 0, [3; 4]);
+                                mask[(j + dy) * size + k + dx] = (AIR, 0, [3; 4], 0);
                             }
                         }
 
@@ -208,6 +225,7 @@ where
                             cell.0,
                             light_to_f32_array(cell.1),
                             cell.2,
+                            cell.3,
                         );
                         k += w;
                     }
@@ -274,6 +292,7 @@ fn emit_quad(
     block: BlockId,
     light: [f32; 4],
     ao: [u8; 4],
+    top_rot: u8,
 ) {
     let plane = slice + if positive { 1 } else { 0 };
     let (k, j, w, h) = (k as i32, j as i32, w as i32, h as i32);
@@ -299,8 +318,13 @@ fn emit_quad(
     let uvs: [[f32; 2]; 4] = match d {
         // ±X: u = Y (w), v = Z (h) -> keep V upright (-Y) and U horizontal (Z)
         0 => [[0.0, wf], [0.0, 0.0], [hf, 0.0], [hf, wf]],
-        // ±Y: u = Z (w), v = X (h)
-        1 => [[0.0, 0.0], [wf, 0.0], [wf, hf], [0.0, hf]],
+        // ±Y: u = Z (w), v = X (h) with optional 0/90/180/270° top-face rotation
+        1 => match top_rot & 3 {
+            1 => [[0.0, hf], [0.0, 0.0], [wf, 0.0], [wf, hf]],
+            2 => [[wf, hf], [0.0, hf], [0.0, 0.0], [wf, 0.0]],
+            3 => [[wf, 0.0], [wf, hf], [0.0, hf], [0.0, 0.0]],
+            _ => [[0.0, 0.0], [wf, 0.0], [wf, hf], [0.0, hf]],
+        },
         // ±Z: u = X (w), v = Y (h) -> keep V upright (-Y) and U horizontal (X)
         _ => [[0.0, hf], [wf, hf], [wf, 0.0], [0.0, 0.0]],
     };
@@ -587,29 +611,53 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
     emit_side(lx, lz - 1, x1, z0, x0, z0, h10, h00, (2, 3), [0.0, 0.0, -1.0]);
 }
 
-/// Emits a glowing translucent fire sub-block (`[0.12..0.88]` on X/Z, `[0.0..0.82]` on Y).
+/// Emits Fire (`BlockId::FIRE`) as two crossed vertical diagonal planes (X-shape)
+/// from `(0,0,0)-(1,1,1)` and `(0,0,1)-(1,1,0)`, visible from both sides (`cull_mode: None`).
 fn emit_fire_voxel(data: &mut MeshData, world_pos: IVec3) {
-    let base_pos = world_pos.as_vec3();
-    emit_box_with_custom_top_ao(
-        data,
-        base_pos + Vec3::new(0.12, 0.0, 0.12),
-        base_pos + Vec3::new(0.88, 0.82, 0.88),
-        [1.0, 1.0, 1.0],
-        [15.0, 8.0, 2.0, 15.0],
-        3.0,
-        MAT_FIRE,
-        TextureLayer::FireLayer0 as u32,
-        [true, true, true, false, true, true],
-    );
+    let b = world_pos.as_vec3();
+    let (x0, y0, z0) = (b.x, b.y, b.z);
+    let (x1, y1, z1) = (b.x + 1.0, b.y + 1.0, b.z + 1.0);
+    const FIRE_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let light = [15.0, 8.0, 2.0, 15.0];
+
+    let planes: [([[f32; 3]; 4], [f32; 3]); 2] = [
+        // Diagonal (0,0,0) -> (1,1,1)
+        (
+            [[x0, y0, z0], [x1, y0, z1], [x1, y1, z1], [x0, y1, z0]],
+            [0.707, 0.0, -0.707],
+        ),
+        // Diagonal (0,0,1) -> (1,1,0)
+        (
+            [[x0, y0, z1], [x1, y0, z0], [x1, y1, z0], [x0, y1, z1]],
+            [0.707, 0.0, 0.707],
+        ),
+    ];
+
+    for (corners, normal) in planes {
+        let base = data.vertices.len() as u32;
+        for (idx, position) in corners.into_iter().enumerate() {
+            data.vertices.push(Vertex {
+                position,
+                normal,
+                color: [1.0, 1.0, 1.0],
+                light,
+                ao_and_flags: [3.0, MAT_FIRE],
+                uv: FIRE_UVS[idx],
+                tex_layer: TextureLayer::FireLayer0 as u32,
+            });
+        }
+        data.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
 }
 
-/// Emits a 2x2x10 pixel Torch post (`x: 0.44..0.56, y: 0.0..0.62, z: 0.44..0.56`)
+/// Emits a 2x2x10 pixel Torch post (`x: 0.4375..0.5625, y: 0.0..0.625, z: 0.4375..0.5625`)
 /// textured with `torch_on.png` (`TextureLayer::TorchOn`) and `MAT_EMISSIVE` (`emission = 2.0`).
 fn emit_torch(data: &mut MeshData, world_pos: IVec3) {
     let base_pos = world_pos.as_vec3();
     let light = [15.0, 12.0, 5.0, 15.0];
-    let min = base_pos + Vec3::new(0.44, 0.0, 0.44);
-    let max = base_pos + Vec3::new(0.56, 0.62, 0.56);
+    let min = base_pos + Vec3::new(0.4375, 0.0, 0.4375);
+    let max = base_pos + Vec3::new(0.5625, 0.625, 0.5625);
     let (x0, y0, z0) = (min.x, min.y, min.z);
     let (x1, y1, z1) = (max.x, max.y, max.z);
 

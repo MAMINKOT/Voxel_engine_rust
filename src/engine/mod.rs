@@ -380,7 +380,25 @@ impl Engine {
                         let can_occupy = is_fluid(stack.id)
                             || stack.id == FIRE
                             || !self.player.intersects_block(pos);
-                        if can_occupy && self.gpu.world.set_block(&self.gpu.device, pos, stack.id) {
+                        // Compute horizontal Facing (0=North(-Z), 1=East(+X), 2=South(+Z), 3=West(-X))
+                        // so the placed block's front face points back toward the player.
+                        let fwd_x = self.camera.yaw.cos();
+                        let fwd_z = self.camera.yaw.sin();
+                        let facing = if fwd_x.abs() >= fwd_z.abs() {
+                            if fwd_x >= 0.0 { 3 } else { 1 }
+                        } else if fwd_z >= 0.0 {
+                            0
+                        } else {
+                            2
+                        };
+                        if can_occupy
+                            && self.gpu.world.set_block_with_facing(
+                                &self.gpu.device,
+                                pos,
+                                stack.id,
+                                facing,
+                            )
+                        {
                             self.inventory.take_one_selected();
                             self.refresh_title();
                         }
