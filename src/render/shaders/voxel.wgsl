@@ -189,14 +189,26 @@ fn sample_sun_shadow(world_pos: vec3<f32>, normal: vec3<f32>, screen_xy: vec2<f3
         vis = vis * (1.0 / 16.0);
     }
 
+    // Smooth shadow fade between 75.0m and 95.0m from camera + outer 10% frustum blend
+    let cam_dist = length(world_pos.xz - camera.cam_pos.xz);
+    let dist_fade = clamp((cam_dist - 75.0) / 20.0, 0.0, 1.0);
     let cascade_blend = clamp((edge - 0.90) / 0.10, 0.0, 1.0);
-    return mix(vis, 1.0, cascade_blend);
+    return mix(vis, 1.0, max(dist_fade, cascade_blend));
 }
 
 // ── Shared Textured + RGB + Sunlight + Poisson PCF Shadow + Smooth AO ─────────
 fn shade_voxel(in: VertexOutput) -> vec4<f32> {
+    // Animated Lava (`tex_layer == 28`, 20 frames @ 32..52) & Fire (`tex_layer == 30`, 32 frames @ 52..84)
+    let global_ticks = u32(max(camera.cam_pos.w, 0.0) * 20.0);
+    var sampled_layer = in.tex_layer;
+    if in.tex_layer == 28u {
+        sampled_layer = 32u + ((global_ticks / 3u) % 20u);
+    } else if in.tex_layer == 30u {
+        sampled_layer = 52u + ((global_ticks / 2u) % 32u);
+    }
+
     // Sample unconditionally in uniform control flow, then apply if `tex_layer != 0xFFFFFFFFu`
-    let safe_layer = min(in.tex_layer, 31u);
+    let safe_layer = min(sampled_layer, 83u);
     let tex_color = textureSample(t_diffuse, s_diffuse, in.uv, i32(safe_layer));
     let has_texture = in.tex_layer != 0xFFFFFFFFu;
 
@@ -248,8 +260,13 @@ fn shade_voxel(in: VertexOutput) -> vec4<f32> {
     }
 
     let tint_linear = pow(clamp(base_srgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
-    let albedo = select(tint_linear, tex_color.rgb * tint_linear, has_texture);
+    var albedo = select(tint_linear, tex_color.rgb * tint_linear, has_texture);
     let alpha = select(1.0, tex_color.a, has_texture);
+
+    // PrimedTNT white flash overlay (`mat_flag == 5.0`)
+    if abs(mat_flag - 5.0) < 0.25 {
+        albedo = mix(albedo, vec3<f32>(1.0, 1.0, 1.0), 0.7);
+    }
 
     if is_emissive {
         return vec4<f32>(albedo * 3.4, alpha);
@@ -271,6 +288,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if camera.sun_color.w > 0.5 {
         let uw = pow(vec3<f32>(0.05, 0.25, 0.60), vec3<f32>(2.2));
         final_color = mix(final_color, vec4<f32>(uw, 1.0), 0.5);
+    } else {
+        // Distance Fog (`80m..180m`) blending smoothly into `sky_color`
+        let dist = length(in.world_pos.xz - camera.cam_pos.xz);
+        let fog_factor = clamp((dist - 80.0) / (180.0 - 80.0), 0.0, 1.0);
+        final_color = vec4<f32>(
+            mix(final_color.rgb, camera.sky_color.rgb, fog_factor * fog_factor),
+            final_color.a
+        );
     }
     return final_color;
 }
@@ -342,6 +367,13 @@ fn fs_translucent(in: VertexOutput) -> @location(0) vec4<f32> {
     if camera.sun_color.w > 0.5 {
         let uw = pow(vec3<f32>(0.05, 0.25, 0.60), vec3<f32>(2.2));
         final_color = mix(final_color, vec4<f32>(uw, alpha), 0.5);
+    } else {
+        let dist = length(in.world_pos.xz - camera.cam_pos.xz);
+        let fog_factor = clamp((dist - 80.0) / (180.0 - 80.0), 0.0, 1.0);
+        final_color = vec4<f32>(
+            mix(final_color.rgb, camera.sky_color.rgb, fog_factor * fog_factor),
+            final_color.a
+        );
     }
     return final_color;
 }

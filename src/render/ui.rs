@@ -6,9 +6,12 @@
 //   • NEI / JEI-style right sidebar: all items browser + interactive Recipe & Usage Viewer.
 //   • Hover tooltips with item names and floating cursor stack icon.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use egui::{
     Align2, Color32, Context, Event as EguiEvent, FontId, Id, Key, Modifiers, PointerButton, Pos2,
-    RawInput, Rect, Rounding, Sense, Stroke, Vec2,
+    RawInput, Rect, Rounding, Sense, Stroke, TextureHandle, TextureId, TextureOptions, Vec2,
 };
 use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
 use glam::IVec3;
@@ -18,6 +21,7 @@ use crate::crafting::{consume_crafting_ingredients, Recipe, RecipeRegistry};
 use crate::inventory::{
     interact_slot, ItemStack, PlayerInventory, HOTBAR_SIZE, MAIN_INV_COLS, MAIN_INV_ROWS, MAX_STACK,
 };
+use crate::render::texture::build_ui_item_icons;
 use crate::sim::energy_net::EnergyNetwork;
 use crate::ui::debug::{draw_debug_overlay, DebugInfo};
 use crate::ui::menu::{draw_options_menu, draw_pause_menu, GraphicsSettings, PauseMenuAction};
@@ -49,12 +53,30 @@ pub struct UiSystem {
     pub screen: UiScreen,
     pub debug_open: bool,
     nei_query: Option<(BlockId, NeiMode)>,
+    #[allow(dead_code)]
+    item_icons: HashMap<BlockId, TextureHandle>,
 }
 
 impl UiSystem {
     pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let ctx = Context::default();
         let renderer = EguiRenderer::new(device, surface_format, None, 1);
+        let raw_icons = build_ui_item_icons();
+        let mut item_icons = HashMap::with_capacity(raw_icons.len());
+        let mut icon_ids = HashMap::with_capacity(raw_icons.len());
+        for (id, color_img) in raw_icons {
+            let handle = ctx.load_texture(
+                format!("item_icon_{}", id),
+                color_img,
+                TextureOptions::NEAREST,
+            );
+            icon_ids.insert(id, handle.id());
+            item_icons.insert(id, handle);
+        }
+        ctx.data_mut(|d| {
+            d.insert_temp(Id::new("item_icon_ids"), Arc::new(icon_ids));
+        });
+
         Self {
             ctx,
             renderer,
@@ -63,6 +85,7 @@ impl UiSystem {
             screen: UiScreen::Closed,
             debug_open: false,
             nei_query: None,
+            item_icons,
         }
     }
 
@@ -227,6 +250,28 @@ fn item_color32(id: BlockId) -> Color32 {
     )
 }
 
+fn draw_item_icon(ctx: &Context, painter: &egui::Painter, icon_rect: Rect, id: BlockId) {
+    let tex_id = ctx.data(|d| {
+        d.get_temp::<Arc<HashMap<BlockId, TextureId>>>(Id::new("item_icon_ids"))
+            .and_then(|map| map.get(&id).copied())
+    });
+    if let Some(tid) = tex_id {
+        painter.image(
+            tid,
+            icon_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    } else {
+        painter.rect(
+            icon_rect,
+            Rounding::same(3.0),
+            item_color32(id),
+            Stroke::new(1.0_f32, Color32::from_black_alpha(140)),
+        );
+    }
+}
+
 /// Draws a single textureless colored slot and handles left/right click + tooltip on hover.
 fn draw_slot_widget<F: Fn(BlockId) -> bool>(
     ui: &mut egui::Ui,
@@ -255,13 +300,8 @@ fn draw_slot_widget<F: Fn(BlockId) -> bool>(
     painter.rect(rect, Rounding::same(4.0), bg, border);
 
     if let Some(stack) = *slot {
-        let icon_rect = rect.shrink(7.0);
-        painter.rect(
-            icon_rect,
-            Rounding::same(3.0),
-            item_color32(stack.id),
-            Stroke::new(1.0_f32, Color32::from_black_alpha(140)),
-        );
+        let icon_rect = rect.shrink(6.0);
+        draw_item_icon(ui.ctx(), painter, icon_rect, stack.id);
         if stack.count > 1 {
             painter.text(
                 rect.right_bottom() - Vec2::new(4.0, 2.0),
@@ -317,13 +357,8 @@ fn draw_readonly_item_badge(
     );
 
     if let Some(st) = stack {
-        let icon_rect = rect.shrink(5.0);
-        painter.rect(
-            icon_rect,
-            Rounding::same(3.0),
-            item_color32(st.id),
-            Stroke::new(1.0_f32, Color32::from_black_alpha(140)),
-        );
+        let icon_rect = rect.shrink(4.0);
+        draw_item_icon(ui.ctx(), painter, icon_rect, st.id);
         if st.count > 1 {
             painter.text(
                 rect.right_bottom() - Vec2::new(3.0, 1.0),
@@ -401,13 +436,8 @@ fn draw_crafting_widget(
             );
 
             if let Some(out) = matched {
-                let icon_rect = rect.shrink(8.0);
-                painter.rect(
-                    icon_rect,
-                    Rounding::same(3.0),
-                    item_color32(out.id),
-                    Stroke::new(1.0_f32, Color32::from_black_alpha(140)),
-                );
+                let icon_rect = rect.shrink(6.0);
+                draw_item_icon(ui.ctx(), painter, icon_rect, out.id);
                 if out.count > 1 {
                     painter.text(
                         rect.right_bottom() - Vec2::new(4.0, 2.0),
@@ -1009,12 +1039,7 @@ fn draw_nei_sidebar(
                             Stroke::new(1.0_f32, Color32::from_rgb(78, 82, 94))
                         };
                         ui.painter().rect(rect, Rounding::same(4.0), bg, border);
-                        ui.painter().rect(
-                            rect.shrink(6.0),
-                            Rounding::same(3.0),
-                            item_color32(item_id),
-                            Stroke::new(1.0_f32, Color32::from_black_alpha(140)),
-                        );
+                        draw_item_icon(ui.ctx(), ui.painter(), rect.shrink(5.0), item_id);
 
                         if response.clicked_by(PointerButton::Primary) {
                             *nei_query = Some((item_id, NeiMode::Recipes));
@@ -1243,12 +1268,7 @@ fn draw_cursor_stack(ctx: &Context, pos: Pos2, stack: ItemStack) {
         Id::new("cursor_item_layer"),
     ));
     let rect = Rect::from_center_size(pos + Vec2::new(14.0, 14.0), Vec2::splat(30.0));
-    painter.rect(
-        rect,
-        Rounding::same(3.0),
-        item_color32(stack.id),
-        Stroke::new(1.5_f32, Color32::WHITE),
-    );
+    draw_item_icon(ctx, &painter, rect, stack.id);
     painter.text(
         rect.right_bottom() - Vec2::new(2.0, 1.0),
         Align2::RIGHT_BOTTOM,

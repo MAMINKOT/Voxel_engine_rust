@@ -6,7 +6,8 @@
 use glam::{IVec3, Vec3};
 
 use crate::voxel::blocks::{
-    get_face_texture, texture_tint_color, BlockFace, TextureLayer, NO_TEXTURE,
+    block_face_emission, get_face_texture, texture_tint_color, BlockFace, TextureLayer,
+    NO_TEXTURE,
 };
 use crate::voxel::chunk::{
     base_block_id, block_face_color, fluid_level_from_id, is_active_block, is_energy_connectable,
@@ -287,7 +288,11 @@ fn emit_quad(
     } else {
         block_face_color(block, d)
     };
-    let mat_flag = if active { MAT_EMISSIVE } else { MAT_STANDARD };
+    let mat_flag = if block_face_emission(block, face, active) > 0.0 {
+        MAT_EMISSIVE
+    } else {
+        MAT_STANDARD
+    };
 
     let wf = w as f32;
     let hf = h as f32;
@@ -598,29 +603,56 @@ fn emit_fire_voxel(data: &mut MeshData, world_pos: IVec3) {
     );
 }
 
-/// Emits a Torch sub-block (`[0.42..0.58]` wooden stick + `[0.40..0.60]` glowing flame tip).
+/// Emits a 2x2x10 pixel Torch post (`x: 0.44..0.56, y: 0.0..0.62, z: 0.44..0.56`)
+/// textured with `torch_on.png` (`TextureLayer::TorchOn`) and `MAT_EMISSIVE` (`emission = 2.0`).
 fn emit_torch(data: &mut MeshData, world_pos: IVec3) {
     let base_pos = world_pos.as_vec3();
     let light = [15.0, 12.0, 5.0, 15.0];
-    // Wooden handle (non-emissive)
-    emit_box(
-        data,
-        base_pos + Vec3::new(0.42, 0.0, 0.42),
-        base_pos + Vec3::new(0.58, 0.50, 0.58),
-        [0.52, 0.36, 0.20],
-        light,
-        [true, true, false, true, true, true],
-    );
-    // Glowing flame head (emissive -> triggers Bloom!)
-    emit_box_with_flag(
-        data,
-        base_pos + Vec3::new(0.40, 0.50, 0.40),
-        base_pos + Vec3::new(0.60, 0.66, 0.60),
-        block_face_color(TORCH, 1),
-        light,
-        MAT_EMISSIVE,
-        [true, true, true, false, true, true],
-    );
+    let min = base_pos + Vec3::new(0.44, 0.0, 0.44);
+    let max = base_pos + Vec3::new(0.56, 0.62, 0.56);
+    let (x0, y0, z0) = (min.x, min.y, min.z);
+    let (x1, y1, z1) = (max.x, max.y, max.z);
+
+    // Map the center 2x10 pixel column of `torch_on.png` (`u: 7/16..9/16`, `v: 6/16..1.0`)
+    // onto the 4 sides, and the glowing tip (`u: 7/16..9/16`, `v: 6/16..8/16`) onto the top cap.
+    const U0: f32 = 7.0 / 16.0;
+    const U1: f32 = 9.0 / 16.0;
+    const V_TOP: f32 = 6.0 / 16.0;
+    const V_MID: f32 = 8.0 / 16.0;
+    const V_BOT: f32 = 1.0;
+
+    let side_uvs = [[U0, V_BOT], [U1, V_BOT], [U1, V_MID], [U0, V_MID]];
+    let top_uvs = [[U0, V_MID], [U1, V_MID], [U1, V_TOP], [U0, V_TOP]];
+
+    let quads: [([[f32; 3]; 4], [f32; 3], [[f32; 2]; 4], f32); 5] = [
+        // +X
+        ([[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]], [1.0, 0.0, 0.0], side_uvs, MAT_STANDARD),
+        // -X
+        ([[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]], [-1.0, 0.0, 0.0], side_uvs, MAT_STANDARD),
+        // +Y (glowing flame tip -> triggers soft Bloom!)
+        ([[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]], [0.0, 1.0, 0.0], top_uvs, MAT_EMISSIVE),
+        // +Z
+        ([[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]], [0.0, 0.0, 1.0], side_uvs, MAT_STANDARD),
+        // -Z
+        ([[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]], [0.0, 0.0, -1.0], side_uvs, MAT_STANDARD),
+    ];
+
+    for (corners, normal, uvs, mat_flag) in quads {
+        let base = data.vertices.len() as u32;
+        for (idx, position) in corners.into_iter().enumerate() {
+            data.vertices.push(Vertex {
+                position,
+                normal,
+                color: [1.0, 1.0, 1.0],
+                light,
+                ao_and_flags: [3.0, mat_flag],
+                uv: uvs[idx],
+                tex_layer: TextureLayer::TorchOn as u32,
+            });
+        }
+        data.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
 }
 
 /// Emits a translucent `PURPLE_STAINED_GLASS` block, culling faces shared with adjacent glass or opaque cubes.

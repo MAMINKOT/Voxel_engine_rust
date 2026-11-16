@@ -1,9 +1,12 @@
 // Item drops: tiny physical items that fall, rest on voxels, get pulled in by a magnet and
 // are picked up into the hotbar.
 
-use glam::{IVec3, Mat3, Vec3};
+use std::f32::consts::FRAC_PI_2;
+
+use glam::{EulerRot, IVec3, Mat3, Vec3};
 
 use crate::inventory::{PlayerInventory, MAX_STACK};
+use crate::voxel::blocks::{get_face_texture, texture_tint_color, BlockFace, NO_TEXTURE};
 use crate::voxel::chunk::{block_color, BlockId};
 use crate::voxel::mesher::Vertex;
 use crate::voxel::world::World;
@@ -28,9 +31,12 @@ const MAX_STEP: f32 = 1.0 / 60.0;
 pub struct ItemDrop {
     pub position: Vec3, // centre of the cube
     pub velocity: Vec3,
+    pub rotation: Vec3,
+    pub angular_velocity: Vec3,
+    pub on_ground: bool,
     pub block_id: BlockId,
     pub count: u16,
-    /// Seconds since spawn (also drives the spin/levitation animation).
+    /// Seconds since spawn.
     pub lifetime: f32,
 }
 
@@ -65,13 +71,28 @@ impl Drops {
         (self.rng >> 8) as f32 / (1u32 << 24) as f32
     }
 
-    /// Spawns a drop at `position` with an upward toss and a random sideways impulse.
+    /// Spawns a drop at `position` with an upward toss, sideways impulse, and random tumble spin.
     pub fn spawn(&mut self, position: Vec3, block_id: BlockId, count: u16) {
         if self.items.len() >= MAX_DROPS || count == 0 {
             return;
         }
         let velocity = Vec3::new((self.random() - 0.5) * 3.0, 3.0, (self.random() - 0.5) * 3.0);
-        self.items.push(ItemDrop { position, velocity, block_id, count, lifetime: 0.0 });
+        let angular_velocity = Vec3::new(
+            (self.random() - 0.5) * 9.0,
+            (self.random() - 0.5) * 9.0,
+            (self.random() - 0.5) * 9.0,
+        );
+        let initial_yaw = self.random() * std::f32::consts::TAU;
+        self.items.push(ItemDrop {
+            position,
+            velocity,
+            rotation: Vec3::new(0.0, initial_yaw, 0.0),
+            angular_velocity,
+            on_ground: false,
+            block_id,
+            count,
+            lifetime: 0.0,
+        });
     }
 
     pub fn update(
@@ -165,7 +186,7 @@ fn step_physics(drop: &mut ItemDrop, h: f32, world: &World) {
     } else {
         drop.velocity.y = (drop.velocity.y + GRAVITY * h).max(TERMINAL_VELOCITY);
     }
-    let mut on_ground = false;
+    let mut landed_this_step = false;
 
     for axis in 0..3 {
         let delta = drop.velocity[axis] * h;
@@ -180,7 +201,7 @@ fn step_physics(drop: &mut ItemDrop, h: f32, world: &World) {
 
         if world.is_solid(cell) {
             if axis == 1 && delta < 0.0 {
-                on_ground = true;
+                landed_this_step = true;
                 // Rest exactly on top of the block.
                 drop.position.y = cell.y as f32 + 1.0 + HALF_SIZE;
             }
@@ -190,11 +211,29 @@ fn step_physics(drop: &mut ItemDrop, h: f32, world: &World) {
         }
     }
 
-    if on_ground {
+    // Check if support block underneath still exists
+    let support_cell = (drop.position - Vec3::Y * (HALF_SIZE + 0.03)).floor().as_ivec3();
+    let supported = landed_this_step || (drop.velocity.y.abs() < 0.01 && world.is_solid(support_cell));
+
+    if supported {
+        if !drop.on_ground {
+            // Just touched the ground: stop spinning and settle flat onto the nearest cube face
+            // with a tiny natural resting deviation.
+            drop.on_ground = true;
+            drop.angular_velocity = Vec3::ZERO;
+            let snap_x = (drop.rotation.x / FRAC_PI_2).round() * FRAC_PI_2;
+            let snap_z = (drop.rotation.z / FRAC_PI_2).round() * FRAC_PI_2;
+            let jitter = ((drop.position.x * 13.7 + drop.position.z * 7.3).sin()) * 0.05;
+            drop.rotation.x = snap_x + jitter;
+            drop.rotation.z = snap_z - jitter * 0.5;
+        }
         // Ground friction (per-second factor, frame-rate independent).
         let friction = 0.02_f32.powf(h);
         drop.velocity.x *= friction;
         drop.velocity.z *= friction;
+    } else {
+        drop.on_ground = false;
+        drop.rotation += drop.angular_velocity * h;
     }
 }
 
@@ -204,14 +243,17 @@ pub fn block_center(block: IVec3) -> Vec3 {
 }
 
 /// Builds a combined vertex + index mesh for all active drops (0.25x0.25x0.25 cubes
-/// spinning around Y and gently bobbing up and down).
-pub fn build_drops_mesh(items: &[ItemDrop]) -> (Vec<Vertex>, Vec<u32>) {
+/// with natural resting orientation, multi-face BlockDef textures, and world light sampling).
+pub fn build_drops_mesh<F: Fn(IVec3) -> [f32; 4]>(
+    items: &[ItemDrop],
+    sample_light: F,
+) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::with_capacity(items.len() * 24);
     let mut indices = Vec::with_capacity(items.len() * 36);
 
     const H: f32 = HALF_SIZE; // 0.125 -> 0.25 cube
-    // 6 faces in local space: (4 CCW corners, outward normal).
-    const FACES: [([Vec3; 4], Vec3); 6] = [
+    // 6 faces in local space: (4 CCW corners, outward normal, BlockFace, axis).
+    const FACES: [([Vec3; 4], Vec3, BlockFace, usize); 6] = [
         // +X
         (
             [
@@ -221,6 +263,8 @@ pub fn build_drops_mesh(items: &[ItemDrop]) -> (Vec<Vertex>, Vec<u32>) {
                 Vec3::new(H, H, H),
             ],
             Vec3::X,
+            BlockFace::PosX,
+            0,
         ),
         // -X
         (
@@ -231,6 +275,8 @@ pub fn build_drops_mesh(items: &[ItemDrop]) -> (Vec<Vertex>, Vec<u32>) {
                 Vec3::new(-H, H, -H),
             ],
             Vec3::NEG_X,
+            BlockFace::NegX,
+            0,
         ),
         // +Y
         (
@@ -241,6 +287,8 @@ pub fn build_drops_mesh(items: &[ItemDrop]) -> (Vec<Vertex>, Vec<u32>) {
                 Vec3::new(-H, H, -H),
             ],
             Vec3::Y,
+            BlockFace::PosY,
+            1,
         ),
         // -Y
         (
@@ -251,6 +299,8 @@ pub fn build_drops_mesh(items: &[ItemDrop]) -> (Vec<Vertex>, Vec<u32>) {
                 Vec3::new(-H, -H, H),
             ],
             Vec3::NEG_Y,
+            BlockFace::NegY,
+            1,
         ),
         // +Z
         (
@@ -261,6 +311,8 @@ pub fn build_drops_mesh(items: &[ItemDrop]) -> (Vec<Vertex>, Vec<u32>) {
                 Vec3::new(-H, H, H),
             ],
             Vec3::Z,
+            BlockFace::PosZ,
+            2,
         ),
         // -Z
         (
@@ -271,27 +323,26 @@ pub fn build_drops_mesh(items: &[ItemDrop]) -> (Vec<Vertex>, Vec<u32>) {
                 Vec3::new(H, H, -H),
             ],
             Vec3::NEG_Z,
+            BlockFace::NegZ,
+            2,
         ),
     ];
 
-    for drop in items {
-        let angle = drop.lifetime * 2.2;
-        let bob = (drop.lifetime * 3.2).sin() * 0.05 + 0.05;
-        let center = drop.position + Vec3::Y * bob;
-        let rot = Mat3::from_rotation_y(angle);
-        let tex_layer = crate::voxel::blocks::get_face_texture(
-            drop.block_id,
-            crate::voxel::blocks::BlockFace::PosZ,
-            false,
-        );
-        let color = if tex_layer != crate::voxel::blocks::NO_TEXTURE {
-            crate::voxel::blocks::texture_tint_color(drop.block_id, 1)
-        } else {
-            block_color(drop.block_id)
-        };
-        const DROP_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    const DROP_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
 
-        for (corners, normal) in FACES {
+    for drop in items {
+        let center = drop.position;
+        let rot = Mat3::from_euler(EulerRot::YXZ, drop.rotation.y, drop.rotation.x, drop.rotation.z);
+        let light = sample_light(drop.position.floor().as_ivec3());
+
+        for (corners, normal, face, axis) in FACES {
+            let tex_layer = get_face_texture(drop.block_id, face, false);
+            let color = if tex_layer != NO_TEXTURE {
+                texture_tint_color(drop.block_id, axis)
+            } else {
+                block_color(drop.block_id)
+            };
+
             let base = vertices.len() as u32;
             let n = (rot * normal).to_array();
             for (idx, c) in corners.into_iter().enumerate() {
@@ -300,7 +351,7 @@ pub fn build_drops_mesh(items: &[ItemDrop]) -> (Vec<Vertex>, Vec<u32>) {
                     position: p,
                     normal: n,
                     color,
-                    light: [12.0, 12.0, 12.0, 15.0],
+                    light,
                     ao_and_flags: [3.0, 0.0],
                     uv: DROP_UVS[idx],
                     tex_layer,

@@ -316,18 +316,8 @@ impl ExplosionSystem {
     /// Appends 3D flashing cubes for all active `PrimedTnt` entities to a dynamic mesh.
     pub fn append_mesh(&self, vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
         for tnt in &self.primed {
-            // Flash white every 4 ticks (hissing/blinking effect), clamped <= 1.0 (non-emissive)
-            let flash_white = (tnt.fuse_ticks / 4) % 2 == 0;
-            let side_color = if flash_white {
-                [1.0, 1.0, 1.0]
-            } else {
-                [0.92, 0.20, 0.16]
-            };
-            let top_color = if flash_white {
-                [1.0, 1.0, 1.0]
-            } else {
-                [0.95, 0.90, 0.85]
-            };
+            // Flash white for 5 ticks every 10 ticks (`(fuse_ticks % 10) < 5`)
+            let flash_white = (tnt.fuse_ticks % 10) < 5;
 
             // Slightly pulsing scale as fuse nears zero
             let pulse = 1.0 + 0.06 * ((tnt.fuse_ticks as f32 * 0.6).sin().abs());
@@ -337,55 +327,50 @@ impl ExplosionSystem {
             let (x0, y0, z0) = (min.x, min.y, min.z);
             let (x1, y1, z1) = (max.x, max.y, max.z);
 
-            let faces: [([[f32; 3]; 4], [f32; 3], [f32; 3]); 6] = [
+            let faces: [([[f32; 3]; 4], [f32; 3], u32); 6] = [
                 (
                     [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]],
                     [1.0, 0.0, 0.0],
-                    side_color,
+                    crate::voxel::blocks::TextureLayer::TntSide as u32,
                 ),
                 (
                     [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]],
                     [-1.0, 0.0, 0.0],
-                    side_color,
+                    crate::voxel::blocks::TextureLayer::TntSide as u32,
                 ),
                 (
                     [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]],
                     [0.0, 1.0, 0.0],
-                    top_color,
+                    crate::voxel::blocks::TextureLayer::TntTop as u32,
                 ),
                 (
                     [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
                     [0.0, -1.0, 0.0],
-                    top_color,
+                    crate::voxel::blocks::TextureLayer::TntBottom as u32,
                 ),
                 (
                     [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
                     [0.0, 0.0, 1.0],
-                    side_color,
+                    crate::voxel::blocks::TextureLayer::TntSide as u32,
                 ),
                 (
                     [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
                     [0.0, 0.0, -1.0],
-                    side_color,
+                    crate::voxel::blocks::TextureLayer::TntSide as u32,
                 ),
             ];
 
             const TNT_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
-            let tex_layer = if flash_white {
-                crate::voxel::blocks::NO_TEXTURE
-            } else {
-                crate::voxel::blocks::TextureLayer::TntSide as u32
-            };
-            let face_tint = if flash_white { side_color } else { [1.0, 1.0, 1.0] };
-            for (corners, normal, _color) in faces {
+            let mat_flag = if flash_white { 5.0 } else { 0.0 };
+            for (corners, normal, tex_layer) in faces {
                 let base = vertices.len() as u32;
                 for (idx, position) in corners.into_iter().enumerate() {
                     vertices.push(Vertex {
                         position,
                         normal,
-                        color: face_tint,
+                        color: [1.0, 1.0, 1.0],
                         light: [15.0, 15.0, 15.0, 15.0],
-                        ao_and_flags: [3.0, 0.0],
+                        ao_and_flags: [3.0, mat_flag],
                         uv: TNT_UVS[idx],
                         tex_layer,
                     });

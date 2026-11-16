@@ -1,4 +1,4 @@
-// Texture layer registry for the 2D Texture Array (`wgpu::TextureViewDimension::D2Array`)
+// Declarative Block Definition Registry (`BlockDef`), 2D Texture Array layer registry,
 // and per-face block-to-texture mapping (`get_face_texture`).
 
 use crate::voxel::chunk::{
@@ -12,10 +12,18 @@ use crate::voxel::chunk::{
 /// (e.g. `Water`, `Oil`, `Cable`).
 pub const NO_TEXTURE: u32 = u32::MAX;
 
-/// Total number of 16x16 layers in the `texture_2d_array<f32>`.
-pub const TOTAL_LAYERS: u32 = 32;
+pub const LAVA_ANIM_START: u32 = 32;
+pub const LAVA_FRAMES: u32 = 20;
+pub const FIRE_ANIM_START: u32 = 52;
+pub const FIRE_FRAMES: u32 = 32;
 
-/// Sequence of 16x16 layers in the GPU 2D Texture Array (`0..32`).
+/// Total number of 16x16 layers in the `texture_2d_array<f32>`:
+///   - `0..32`: base static textures + frame 0 of lava/fire
+///   - `32..52`: 20 animation frames of `lava_still.png`
+///   - `52..84`: 32 animation frames of `fire_layer_0.png`
+pub const TOTAL_LAYERS: u32 = FIRE_ANIM_START + FIRE_FRAMES;
+
+/// Sequence of 16x16 base layers in the GPU 2D Texture Array (`0..32`).
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextureLayer {
@@ -74,6 +82,156 @@ impl BlockFace {
             (2, true) => Self::PosZ,
             _ => Self::NegZ,
         }
+    }
+}
+
+/// Unified declarative block definition: per-face textures, opacity, and light emission.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct BlockDef {
+    pub id: u16,
+    pub name: &'static str,
+    pub top_tex: &'static str,
+    pub bottom_tex: &'static str,
+    pub north_tex: &'static str,
+    pub south_tex: &'static str,
+    pub east_tex: &'static str,
+    pub west_tex: &'static str,
+    pub is_opaque: bool,
+    /// > 0.0 ONLY for light sources (`lava`, `torch`, `fire`, active furnace front).
+    pub emission: f32,
+}
+
+impl BlockDef {
+    const fn uniform(
+        id: u16,
+        name: &'static str,
+        tex: &'static str,
+        is_opaque: bool,
+        emission: f32,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            top_tex: tex,
+            bottom_tex: tex,
+            north_tex: tex,
+            south_tex: tex,
+            east_tex: tex,
+            west_tex: tex,
+            is_opaque,
+            emission,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub const BLOCK_DEFS: &[BlockDef] = &[
+    BlockDef::uniform(STONE, "Stone", "stone.png", true, 0.0),
+    BlockDef::uniform(DIRT, "Dirt", "dirt.png", true, 0.0),
+    BlockDef {
+        id: GRASS,
+        name: "Grass",
+        top_tex: "grass_top.png",
+        bottom_tex: "dirt.png",
+        north_tex: "grass_side.png",
+        south_tex: "grass_side.png",
+        east_tex: "grass_side.png",
+        west_tex: "grass_side.png",
+        is_opaque: true,
+        emission: 0.0,
+    },
+    BlockDef::uniform(COBBLESTONE, "Cobblestone", "cobblestone.png", true, 0.0),
+    BlockDef::uniform(COAL_ORE, "Coal Ore", "coal_ore.png", true, 0.0),
+    BlockDef::uniform(COPPER_ORE, "Copper Ore", "iron_ore.png", true, 0.0),
+    BlockDef::uniform(TIN_ORE, "Tin Ore", "iron_ore.png", true, 0.0),
+    BlockDef::uniform(IRON_ORE, "Iron Ore", "iron_ore.png", true, 0.0),
+    BlockDef::uniform(OBSIDIAN, "Obsidian", "obsidian.png", true, 0.0),
+    BlockDef::uniform(BEDROCK, "Bedrock", "obsidian.png", true, 0.0),
+    BlockDef {
+        id: WOOD,
+        name: "Oak Log",
+        top_tex: "log_oak_top.png",
+        bottom_tex: "log_oak_top.png",
+        north_tex: "log_oak.png",
+        south_tex: "log_oak.png",
+        east_tex: "log_oak.png",
+        west_tex: "log_oak.png",
+        is_opaque: true,
+        emission: 0.0,
+    },
+    BlockDef::uniform(OAK_LEAVES, "Oak Leaves", "leaves_oak.png", false, 0.0),
+    BlockDef::uniform(
+        PURPLE_STAINED_GLASS,
+        "Purple Stained Glass",
+        "glass_magenta.png",
+        false,
+        0.0,
+    ),
+    BlockDef {
+        id: WORKBENCH,
+        name: "Crafting Workbench",
+        top_tex: "crafting_table_top.png",
+        bottom_tex: "log_oak.png",
+        north_tex: "crafting_table_side.png",
+        south_tex: "crafting_table_front.png",
+        east_tex: "crafting_table_side.png",
+        west_tex: "crafting_table_side.png",
+        is_opaque: true,
+        emission: 0.0,
+    },
+    BlockDef {
+        id: SIMPLE_FURNACE,
+        name: "Stone Furnace",
+        top_tex: "furnace_top.png",
+        bottom_tex: "furnace_side.png",
+        north_tex: "furnace_side.png",
+        south_tex: "furnace_front_off.png",
+        east_tex: "furnace_side.png",
+        west_tex: "furnace_side.png",
+        is_opaque: true,
+        emission: 0.0,
+    },
+    BlockDef {
+        id: TNT,
+        name: "TNT",
+        top_tex: "tnt_top.png",
+        bottom_tex: "tnt_bottom.png",
+        north_tex: "tnt_side.png",
+        south_tex: "tnt_side.png",
+        east_tex: "tnt_side.png",
+        west_tex: "tnt_side.png",
+        is_opaque: true,
+        emission: 0.0,
+    },
+    BlockDef::uniform(LAVA, "Lava", "lava_still.png", false, 2.2),
+    BlockDef::uniform(TORCH, "Torch", "torch_on.png", false, 2.0),
+    BlockDef::uniform(FIRE, "Fire", "fire_layer_0.png", false, 2.5),
+];
+
+#[allow(dead_code)]
+pub fn block_def(id: BlockId) -> Option<&'static BlockDef> {
+    let base = base_block_id(id);
+    BLOCK_DEFS.iter().find(|d| d.id == base)
+}
+
+/// Returns the emissive HDR radiance (`0.0` for all normal blocks, `> 0.0` only for
+/// `Lava`, `Torch`, `Fire`, and the glowing front face of active furnaces/generators).
+pub fn block_face_emission(block_id: BlockId, face: BlockFace, is_active: bool) -> f32 {
+    let base = base_block_id(block_id);
+    let active = is_active || is_active_block(block_id);
+    match base {
+        LAVA => 2.2,
+        TORCH => 2.0,
+        FIRE => 2.5,
+        SIMPLE_FURNACE | COAL_GENERATOR | ELECTRIC_FURNACE | ALLOY_SMELTER => {
+            if active && face == BlockFace::PosZ {
+                2.4
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
     }
 }
 
@@ -154,5 +312,29 @@ pub fn texture_tint_color(raw_id: BlockId, axis: usize) -> [f32; 3] {
             let _ = axis;
             block_color(base)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_def_registry_has_expected_textures_and_emissions() {
+        let tnt = block_def(TNT).expect("TNT registered");
+        assert_eq!(tnt.top_tex, "tnt_top.png");
+        assert_eq!(tnt.bottom_tex, "tnt_bottom.png");
+        assert_eq!(tnt.north_tex, "tnt_side.png");
+        assert_eq!(tnt.emission, 0.0);
+
+        let log = block_def(WOOD).expect("Oak Log registered");
+        assert_eq!(log.top_tex, "log_oak_top.png");
+        assert_eq!(log.north_tex, "log_oak.png");
+        assert_eq!(log.emission, 0.0);
+
+        let torch = block_def(TORCH).expect("Torch registered");
+        assert!(torch.emission > 0.0);
+        let lava = block_def(LAVA).expect("Lava registered");
+        assert!(lava.emission > 0.0);
     }
 }

@@ -6,7 +6,7 @@ use glam::{Mat4, Vec3, Vec4};
 use crate::render::pipeline::{vertex_buffer_layout, DEPTH_FORMAT};
 
 pub const SHADOW_MAP_SIZE: u32 = 2048;
-pub const SHADOW_HALF_SIZE: f32 = 24.0;
+pub const SHADOW_HALF_SIZE: f32 = 96.0;
 const SHADOW_Z_NEAR: f32 = 1.0;
 const SHADOW_Z_FAR: f32 = 280.0;
 

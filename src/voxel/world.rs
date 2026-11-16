@@ -511,6 +511,55 @@ impl World {
         true
     }
 
+    /// Samples `[R, G, B, Sunlight]` (`0.0..=15.0`) at world voxel `p` for dynamic entities/drops.
+    pub fn light_at(&self, p: IVec3) -> [f32; 4] {
+        let mut sun = 15.0f32;
+        for y in (p.y + 1)..(CHUNK_SIZE as i32) {
+            let b = self.block(IVec3::new(p.x, y, p.z));
+            if crate::voxel::chunk::is_full_cube(b) {
+                sun = 0.0;
+                break;
+            } else if crate::voxel::chunk::base_block_id(b) == crate::voxel::chunk::WATER {
+                sun = (sun - 2.0).max(0.0);
+            }
+        }
+        let mut r = 0.0f32;
+        let mut g = 0.0f32;
+        let mut b_ch = 0.0f32;
+        for dz in -4i32..=4 {
+            for dy in -3i32..=3 {
+                for dx in -4i32..=4 {
+                    let dist = dx.abs() + dy.abs() + dz.abs();
+                    if dist > 6 {
+                        continue;
+                    }
+                    let q = p + IVec3::new(dx, dy, dz);
+                    let id = self.block(q);
+                    let base = crate::voxel::chunk::base_block_id(id);
+                    let falloff = (14 - dist * 2).max(0) as f32;
+                    match base {
+                        crate::voxel::chunk::TORCH => {
+                            r = r.max(falloff);
+                            g = g.max((falloff - 2.0).max(0.0));
+                            b_ch = b_ch.max((falloff - 7.0).max(0.0));
+                        }
+                        crate::voxel::chunk::LAVA | crate::voxel::chunk::FIRE => {
+                            r = r.max(falloff);
+                            g = g.max((falloff * 0.55).floor());
+                            b_ch = b_ch.max((falloff * 0.15).floor());
+                        }
+                        _ if self.energy.is_machine_active(q) => {
+                            r = r.max(falloff);
+                            g = g.max((falloff * 0.5).floor());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        [r, g, b_ch, sun]
+    }
+
     /// Rebuilds the dynamic GPU mesh for all active item drops and flashing `PrimedTnt` entities.
     pub fn update_drops_mesh(&mut self, device: &wgpu::Device) {
         let items = self.drops.items();
@@ -518,7 +567,7 @@ impl World {
             self.drops_mesh = None;
             return;
         }
-        let (mut vertices, mut indices) = build_drops_mesh(items);
+        let (mut vertices, mut indices) = build_drops_mesh(items, |p| self.light_at(p));
         self.explosions.append_mesh(&mut vertices, &mut indices);
         if vertices.is_empty() || indices.is_empty() {
             self.drops_mesh = None;
