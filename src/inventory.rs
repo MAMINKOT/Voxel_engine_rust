@@ -1,6 +1,8 @@
 // Classical player inventory: 9-slot hotbar + 3x9 (27-slot) main backpack + 2x2 / 3x3 crafting
 // buffers + cursor stack.
 
+use serde::{Deserialize, Serialize};
+
 use crate::voxel::chunk::{
     block_name, BlockId, ALLOY_SMELTER, BATBOX, CABLE, CHEST, COAL_GENERATOR, COAL_ORE,
     COPPER_INGOT, COPPER_ORE, ELECTRIC_FURNACE, IRON_INGOT, IRON_ORE, LAVA, LIGHTER, OIL,
@@ -14,7 +16,7 @@ pub const MAIN_INV_COLS: usize = 9;
 pub const MAIN_INV_SIZE: usize = MAIN_INV_ROWS * MAIN_INV_COLS;
 pub const MAX_STACK: u16 = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ItemStack {
     pub id: BlockId,
     pub count: u16,

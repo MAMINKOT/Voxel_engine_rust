@@ -19,8 +19,8 @@ use crate::sim::energy_net::EnergyNetwork;
 use crate::sim::explosions::{ExplosionSystem, TNT_FUSE_TICKS};
 use crate::voxel::chunk::{
     is_fluid, is_solid_block, with_facing, with_fluid_level, BlockId, Chunk, ACTIVE_MACHINE_FLAG,
-    AIR, BEDROCK, CHUNK_SIZE, COAL_ORE, COPPER_ORE, DIRT, GRASS, IRON_ORE, OAK_LEAVES, STONE,
-    TIN_ORE, TNT, WOOD,
+    AIR, ANDESITE, BEDROCK, CHUNK_SIZE, COAL_ORE, COPPER_ORE, DANDELION, DEAD_BUSH, DIORITE,
+    DIRT, GRANITE, GRASS, IRON_ORE, OAK_LEAVES, ROSE, STONE, TALL_GRASS, TIN_ORE, TNT, WOOD,
 };
 use crate::voxel::drops::{block_center, build_drops_mesh, Drops};
 use crate::voxel::fluid::FluidSimulator;
@@ -62,8 +62,10 @@ fn hash3(x: i32, y: i32, z: i32, seed: u32) -> u32 {
     h
 }
 
-fn terrain_height(wx: i32, wz: i32) -> i32 {
-    let (x, z) = (wx as f32, wz as f32);
+fn terrain_height(wx: i32, wz: i32, seed: u64) -> i32 {
+    let s_off_x = ((seed & 0xFFFF) as f32) * 0.13;
+    let s_off_z = (((seed >> 16) & 0xFFFF) as f32) * 0.17;
+    let (x, z) = (wx as f32 + s_off_x, wz as f32 + s_off_z);
     let h = 16.0
         + 5.0 * (x * 0.06).sin()
         + 4.0 * (z * 0.08).cos()
@@ -72,7 +74,8 @@ fn terrain_height(wx: i32, wz: i32) -> i32 {
     (h as i32).clamp(3, CHUNK_SIZE as i32 - 8)
 }
 
-fn block_for(wx: i32, wy: i32, wz: i32, height: i32) -> BlockId {
+fn block_for(wx: i32, wy: i32, wz: i32, height: i32, seed: u64) -> BlockId {
+    let s32 = (seed ^ (seed >> 32)) as u32;
     if wy == 0 {
         BEDROCK
     } else if wy > height {
@@ -82,9 +85,10 @@ fn block_for(wx: i32, wy: i32, wz: i32, height: i32) -> BlockId {
     } else if wy >= height - 3 {
         DIRT
     } else {
-        // Underground: stone with clustered ore veins (Coal, Copper, Tin, Iron).
-        let cell = hash3(wx.div_euclid(3), wy.div_euclid(3), wz.div_euclid(3), 1) % 1000;
-        let filled = hash3(wx, wy, wz, 2) % 4 != 0;
+        // Underground: stone with clustered ore veins (Coal, Copper, Tin, Iron)
+        // and geological stone pockets (Granite, Diorite, Andesite).
+        let cell = hash3(wx.div_euclid(3), wy.div_euclid(3), wz.div_euclid(3), 1 ^ s32) % 1000;
+        let filled = hash3(wx, wy, wz, 2 ^ s32) % 4 != 0;
         if filled && cell < 40 {
             COAL_ORE
         } else if filled && cell < 65 && wy < height - 5 {
@@ -94,23 +98,46 @@ fn block_for(wx: i32, wy: i32, wz: i32, height: i32) -> BlockId {
         } else if filled && cell < 112 && wy < height - 7 {
             IRON_ORE
         } else {
-            STONE
+            let pocket = hash3(wx.div_euclid(4), wy.div_euclid(4), wz.div_euclid(4), 19 ^ s32) % 100;
+            if pocket < 10 {
+                GRANITE
+            } else if pocket < 19 {
+                DIORITE
+            } else if pocket < 28 {
+                ANDESITE
+            } else {
+                STONE
+            }
         }
     }
 }
 
-fn generate_chunk(coord: IVec3) -> Chunk {
+fn generate_chunk(coord: IVec3, seed: u64) -> Chunk {
     let mut chunk = Chunk::new();
     let n = CHUNK_SIZE as i32;
+    let s32 = (seed ^ (seed >> 32)) as u32;
 
-    // 1. Base terrain & ore veins
+    // 1. Base terrain, stone pockets & ore veins
     for lz in 0..n {
         for lx in 0..n {
             let wx = coord.x * n + lx;
             let wz = coord.z * n + lz;
-            let height = terrain_height(wx, wz);
+            let height = terrain_height(wx, wz, seed);
             for y in 0..=height {
-                chunk.set_block(lx, y, lz, block_for(wx, y, wz, height));
+                chunk.set_block(lx, y, lz, block_for(wx, y, wz, height, seed));
+            }
+            // Surface cross-mesh foliage (`TallGrass`, `Rose`, `Dandelion`, `DeadBush`)
+            if height + 1 < n {
+                let fh = hash3(wx, height + 1, wz, 313 ^ s32) % 1000;
+                if fh < 65 {
+                    chunk.set_block(lx, height + 1, lz, TALL_GRASS);
+                } else if fh < 74 {
+                    chunk.set_block(lx, height + 1, lz, DANDELION);
+                } else if fh < 81 {
+                    chunk.set_block(lx, height + 1, lz, ROSE);
+                } else if fh == 999 {
+                    chunk.set_block(lx, height + 1, lz, DEAD_BUSH);
+                }
             }
         }
     }
@@ -123,10 +150,10 @@ fn generate_chunk(coord: IVec3) -> Chunk {
             if wx.abs() <= 5 && wz.abs() <= 5 {
                 continue; // keep spawn area clear
             }
-            if hash3(wx, 0, wz, 77) % 175 != 0 {
+            if hash3(wx, 0, wz, 77 ^ s32) % 175 != 0 {
                 continue;
             }
-            let base_y = terrain_height(wx, wz);
+            let base_y = terrain_height(wx, wz, seed);
             let trunk_h = 4 + (hash3(wx, 1, wz, 99) % 2) as i32; // 4 or 5 blocks tall
             if base_y + trunk_h + 2 >= n {
                 continue;
@@ -208,6 +235,10 @@ fn block_in_chunks(chunks: &HashMap<IVec3, Chunk>, p: IVec3) -> BlockId {
 
 impl World {
     pub fn generate(device: &wgpu::Device) -> Self {
+        Self::generate_with_seed(device, 0)
+    }
+
+    pub fn generate_with_seed(device: &wgpu::Device, seed: u64) -> Self {
         let mut coords = Vec::with_capacity(256);
         for cz in CHUNK_MIN..=CHUNK_MAX {
             for cx in CHUNK_MIN..=CHUNK_MAX {
@@ -218,7 +249,7 @@ impl World {
         // Parallel terrain generation across all 256 chunks via Rayon.
         let generated: Vec<(IVec3, Chunk)> = coords
             .par_iter()
-            .map(|&coord| (coord, generate_chunk(coord)))
+            .map(|&coord| (coord, generate_chunk(coord, seed)))
             .collect();
 
         let chunks: HashMap<IVec3, Chunk> = generated.into_iter().collect();
@@ -234,29 +265,37 @@ impl World {
             explosions: ExplosionSystem::new(),
         };
 
-        // Parallel initial Greedy Meshing across all 256 chunks via Rayon.
+        world.remesh_all(device);
+        world
+    }
+
+    pub fn remesh_all(&mut self, device: &wgpu::Device) {
+        let coords: Vec<IVec3> = self.chunks.keys().copied().collect();
         let built_meshes: Vec<(IVec3, ChunkMeshData)> = coords
             .par_iter()
-            .map(|&coord| (coord, world.build_mesh(coord)))
+            .map(|&coord| (coord, self.build_mesh(coord)))
             .collect();
 
-        let (mut vertices, mut quads, mut naive_faces) = (0usize, 0usize, 0usize);
         for (coord, data) in built_meshes {
-            vertices += data.opaque.vertices.len() + data.translucent.vertices.len();
-            quads += (data.opaque.indices.len() + data.translucent.indices.len()) / 6;
-            naive_faces += data.opaque.naive_faces;
-            world.upload(device, coord, data);
+            self.upload(device, coord, data);
         }
+    }
 
-        log::info!(
-            "World: {} chunks (16x16), {} greedy quads ({} vertices) vs {} naive faces ({} vertices)",
-            coords.len(),
-            quads,
-            vertices,
-            naive_faces,
-            naive_faces * 4
-        );
-        world
+    pub fn surface_height_at(&self, wx: i32, wz: i32) -> i32 {
+        for y in (0..(CHUNK_SIZE as i32)).rev() {
+            if is_solid_block(self.block(IVec3::new(wx, y, wz))) {
+                return y + 1;
+            }
+        }
+        20
+    }
+
+    pub fn chunks(&self) -> &HashMap<IVec3, Chunk> {
+        &self.chunks
+    }
+
+    pub fn insert_loaded_chunk(&mut self, coord: IVec3, chunk: Chunk) {
+        self.chunks.insert(coord, chunk);
     }
 
     pub fn active_chunk_count(&self) -> usize {
@@ -431,6 +470,7 @@ impl World {
             return false;
         }
         chunk.set_block(local.x, local.y, local.z, id);
+        chunk.is_dirty = true;
         true
     }
 
@@ -513,6 +553,7 @@ impl World {
         let local = IVec3::new(p.x.rem_euclid(n), p.y.rem_euclid(n), p.z.rem_euclid(n));
         if let Some(chunk) = self.chunks.get_mut(&coord) {
             chunk.set_meta(local.x, local.y, local.z, facing & 0x03);
+            chunk.is_dirty = true;
         }
         self.set_block(device, p, id)
     }
@@ -545,6 +586,7 @@ impl World {
 
         if let Some(chunk) = self.chunks.get_mut(&coord) {
             chunk.set_block(local.x, local.y, local.z, id);
+            chunk.is_dirty = true;
         }
 
         if id == AIR && old != AIR && !is_fluid(old) && old != crate::voxel::chunk::FIRE {

@@ -67,6 +67,7 @@ pub enum PauseMenuAction {
     Resume,
     OpenOptions,
     BackToPause,
+    SaveAndQuitToMenu,
     Quit,
 }
 
@@ -110,6 +111,21 @@ pub fn draw_pause_menu(ctx: &Context) -> PauseMenuAction {
                     .clicked()
                 {
                     action = PauseMenuAction::OpenOptions;
+                }
+
+                ui.add_space(8.0);
+                if ui
+                    .add_sized(
+                        btn_size,
+                        egui::Button::new(
+                            RichText::new("💾 Зберегти та вийти в головне меню")
+                                .size(14.5)
+                                .color(Color32::from_rgb(245, 215, 115)),
+                        ),
+                    )
+                    .clicked()
+                {
+                    action = PauseMenuAction::SaveAndQuitToMenu;
                 }
 
                 ui.add_space(8.0);

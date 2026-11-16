@@ -36,8 +36,14 @@ use crate::render::shadows::ShadowRenderer;
 use crate::render::sky::SkyState;
 use crate::render::texture::BlockTextureArray;
 use crate::render::ui::{UiScreen, UiSystem};
+use crate::save::{
+    default_world_meta, delete_world, hash_seed_str, load_world_meta, load_world_overrides,
+    pack_inventory, sanitize_folder_name, save_world, unpack_inventory, WorldMeta,
+};
 use crate::sim::energy_net::TICK_DT;
+use crate::state::AppState;
 use crate::ui::debug::DebugInfo;
+use crate::ui::main_menu::{MainMenuAction, MainMenuState};
 use crate::ui::menu::{GraphicsSettings, PauseMenuAction, ShadowQuality};
 use crate::voxel::chunk::{is_fluid, is_placeable, AIR, FIRE, LIGHTER, TNT, WATER};
 use crate::voxel::raycast::{raycast_blocks, RaycastHit};
@@ -105,6 +111,13 @@ const REACH: f32 = 6.0;
 struct Engine {
     window: Arc<Window>,
     gpu: GpuState,
+    app_state: AppState,
+    main_menu: MainMenuState,
+    active_world_folder: Option<String>,
+    active_world_name: String,
+    active_world_seed: u64,
+    active_world_creative: bool,
+    autosave_accum: f32,
     camera: Camera,
     camera_ctrl: CameraController,
     sky: SkyState,
@@ -151,6 +164,9 @@ impl Engine {
 
     fn close_ui(&mut self, recapture_mouse: bool) {
         self.gpu.ui.screen = UiScreen::Closed;
+        if self.app_state == AppState::Paused {
+            self.app_state = AppState::InGame;
+        }
         for leftover in self.inventory.return_cursor_and_crafting() {
             self.gpu
                 .world
@@ -160,6 +176,102 @@ impl Engine {
         if recapture_mouse {
             self.grab_cursor(true);
         }
+    }
+
+    fn save_active_world(&self) {
+        let Some(folder) = &self.active_world_folder else {
+            return;
+        };
+        let meta = WorldMeta {
+            world_name: self.active_world_name.clone(),
+            seed: self.active_world_seed,
+            time_of_day: self.sky.day_time,
+            game_mode_creative: self.active_world_creative,
+            player_pos: self.player.position().to_array(),
+            player_yaw: self.camera.yaw,
+            player_pitch: self.camera.pitch,
+            player_inventory: pack_inventory(&self.inventory),
+        };
+        if let Err(err) = save_world(folder, &meta, &self.gpu.world) {
+            log::error!("[Save] Failed to save world '{}': {}", folder, err);
+        }
+    }
+
+    fn start_new_world(&mut self, name: String, seed_text: String, creative: bool) {
+        let clean_name = if name.trim().is_empty() {
+            "New Industrial World".to_string()
+        } else {
+            name.trim().to_string()
+        };
+        let folder = sanitize_folder_name(&clean_name);
+        let seed = hash_seed_str(&seed_text);
+
+        self.app_state = AppState::Loading {
+            progress: 0.4,
+            message: format!("Генерація світу '{}'...", clean_name),
+        };
+        self.gpu.world = World::generate_with_seed(&self.gpu.device, seed);
+        self.inventory = PlayerInventory::new();
+        self.sky.day_time = 0.25;
+
+        let spawn_y = self.gpu.world.surface_height_at(0, 0) as f32 + 1.0;
+        let spawn = Vec3::new(0.5, spawn_y.max(18.0), 0.5);
+        self.player.set_pose_and_mode(spawn, creative);
+        self.camera.position = self.player.eye_position();
+        self.camera.yaw = 0.785;
+        self.camera.pitch = -0.25;
+
+        self.active_world_folder = Some(folder.clone());
+        self.active_world_name = clean_name.clone();
+        self.active_world_seed = seed;
+        self.active_world_creative = creative;
+        self.autosave_accum = 0.0;
+
+        let meta = default_world_meta(clean_name, seed, creative, spawn, &self.inventory);
+        let _ = save_world(&folder, &meta, &self.gpu.world);
+        self.main_menu.refresh_worlds();
+
+        self.gpu.ui.screen = UiScreen::Closed;
+        self.app_state = AppState::InGame;
+        self.grab_cursor(true);
+        self.refresh_title();
+    }
+
+    fn load_saved_world(&mut self, folder: String) {
+        let Ok(meta) = load_world_meta(&folder) else {
+            log::error!("[Load] Failed to read level.dat for '{}'", folder);
+            return;
+        };
+
+        self.app_state = AppState::Loading {
+            progress: 0.5,
+            message: format!("Завантаження світу '{}'...", meta.world_name),
+        };
+
+        self.gpu.world = World::generate_with_seed(&self.gpu.device, meta.seed);
+        if let Err(err) = load_world_overrides(&folder, &self.gpu.device, &mut self.gpu.world) {
+            log::warn!("[Load] Partial load warning for '{}': {}", folder, err);
+        }
+
+        self.inventory = PlayerInventory::new();
+        unpack_inventory(&meta.player_inventory, &mut self.inventory);
+        self.sky.day_time = meta.time_of_day;
+        self.player
+            .set_pose_and_mode(Vec3::from_array(meta.player_pos), meta.game_mode_creative);
+        self.camera.position = self.player.eye_position();
+        self.camera.yaw = meta.player_yaw;
+        self.camera.pitch = meta.player_pitch;
+
+        self.active_world_folder = Some(folder);
+        self.active_world_name = meta.world_name;
+        self.active_world_seed = meta.seed;
+        self.active_world_creative = meta.game_mode_creative;
+        self.autosave_accum = 0.0;
+
+        self.gpu.ui.screen = UiScreen::Closed;
+        self.app_state = AppState::InGame;
+        self.grab_cursor(true);
+        self.refresh_title();
     }
 
     // ── Resize ────────────────────────────────────────────────────────────
@@ -240,6 +352,42 @@ impl Engine {
     // ── Input ─────────────────────────────────────────────────────────────
 
     fn handle_key(&mut self, event: &KeyEvent) {
+        let in_menu_screen = matches!(
+            self.app_state,
+            AppState::MainMenu | AppState::WorldSelect | AppState::WorldCreate | AppState::Loading { .. }
+        );
+        if in_menu_screen {
+            let pressed = event.state == ElementState::Pressed;
+            if let PhysicalKey::Code(code) = event.physical_key {
+                let mapped = match code {
+                    KeyCode::Backspace => Some(egui::Key::Backspace),
+                    KeyCode::Delete => Some(egui::Key::Delete),
+                    KeyCode::Enter => Some(egui::Key::Enter),
+                    KeyCode::Escape => Some(egui::Key::Escape),
+                    KeyCode::ArrowLeft => Some(egui::Key::ArrowLeft),
+                    KeyCode::ArrowRight => Some(egui::Key::ArrowRight),
+                    KeyCode::ArrowUp => Some(egui::Key::ArrowUp),
+                    KeyCode::ArrowDown => Some(egui::Key::ArrowDown),
+                    KeyCode::Home => Some(egui::Key::Home),
+                    KeyCode::End => Some(egui::Key::End),
+                    KeyCode::Tab => Some(egui::Key::Tab),
+                    _ => None,
+                };
+                if let Some(k) = mapped {
+                    self.gpu.ui.on_egui_key(k, pressed);
+                }
+            }
+            if pressed {
+                if let Some(txt) = &event.text {
+                    let filtered: String = txt.chars().filter(|c| !c.is_control()).collect();
+                    if !filtered.is_empty() {
+                        self.gpu.ui.on_text_input(&filtered);
+                    }
+                }
+            }
+            return;
+        }
+
         if event.state == ElementState::Pressed && !event.repeat {
             if let PhysicalKey::Code(code) = event.physical_key {
                 // F3: toggle diagnostic debug overlay.
@@ -252,7 +400,7 @@ impl Engine {
                     self.sky.skip(150.0);
                     return;
                 }
-                // Escape: close Inventory/Machine UI if open; otherwise toggle Pause Menu (`GameState::Paused`).
+                // Escape: close Inventory/Machine UI if open; otherwise toggle Pause Menu (`AppState::Paused`).
                 if code == KeyCode::Escape {
                     match self.gpu.ui.screen {
                         UiScreen::Inventory | UiScreen::Machine(_) | UiScreen::PauseMenu => {
@@ -262,6 +410,7 @@ impl Engine {
                             self.gpu.ui.screen = UiScreen::PauseMenu;
                         }
                         UiScreen::Closed => {
+                            self.app_state = AppState::Paused;
                             self.open_ui(UiScreen::PauseMenu);
                         }
                     }
@@ -305,7 +454,7 @@ impl Engine {
     }
 
     fn handle_scroll(&mut self, delta: &MouseScrollDelta) {
-        if self.gpu.ui.is_open() {
+        if self.app_state != AppState::InGame || self.gpu.ui.is_open() {
             return;
         }
         let scroll = match delta {
@@ -323,7 +472,7 @@ impl Engine {
 
     /// First click captures the cursor; afterwards LMB breaks and RMB opens machine UI or places.
     fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
-        if self.gpu.ui.is_open() {
+        if self.app_state != AppState::InGame || self.gpu.ui.is_open() {
             self.gpu.ui.on_mouse_button(button, state);
             return;
         }
@@ -427,12 +576,20 @@ impl Engine {
             self.refresh_memory_stats();
         }
 
-        // When in Pause Menu / Options Menu (`GameState::Paused`), freeze world simulation & player movement.
-        if self.gpu.ui.is_paused() {
+        // When not in active gameplay (`MainMenu`, `WorldSelect`, `WorldCreate`, `Loading`, `Paused`),
+        // freeze world simulation & player movement.
+        if self.app_state != AppState::InGame || self.gpu.ui.is_paused() {
             if one_sec_elapsed {
                 self.refresh_title();
             }
             return;
+        }
+
+        // Periodic background autosave every 60 seconds
+        self.autosave_accum += dt_secs;
+        if self.autosave_accum >= 60.0 {
+            self.autosave_accum = 0.0;
+            self.save_active_world();
         }
 
         self.elapsed_secs = (self.elapsed_secs + dt_secs) % 100_000.0;
@@ -652,8 +809,8 @@ impl Engine {
         // 5. Post-Processing: 1/4-Res Kawase Bloom + 32-step Volumetric God Rays + ACES Tonemap + Vignette
         self.gpu.postprocess.execute(&mut encoder, &view);
 
-        // 6. 2D Crosshair on top of the tonemapped swapchain surface
-        {
+        // 6. 2D Crosshair on top of the tonemapped swapchain surface (only in active gameplay)
+        if self.app_state == AppState::InGame && !self.gpu.ui.is_open() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("crosshair_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -707,7 +864,7 @@ impl Engine {
         let GpuState { device, queue, world, ui, .. } = &mut self.gpu;
         let mut energy =
             std::mem::replace(&mut world.energy, crate::sim::energy_net::EnergyNetwork::new());
-        let menu_action = ui.render(
+        let (menu_action, main_action) = ui.render(
             device,
             queue,
             &mut encoder,
@@ -716,6 +873,8 @@ impl Engine {
             height,
             scale_factor,
             self.last_dt_secs,
+            &self.app_state,
+            &mut self.main_menu,
             &mut self.inventory,
             &mut energy,
             &mut self.settings,
@@ -735,8 +894,52 @@ impl Engine {
             PauseMenuAction::BackToPause => {
                 self.gpu.ui.screen = UiScreen::PauseMenu;
             }
+            PauseMenuAction::SaveAndQuitToMenu => {
+                self.save_active_world();
+                self.gpu.ui.screen = UiScreen::Closed;
+                self.grab_cursor(false);
+                self.main_menu.refresh_worlds();
+                self.app_state = AppState::MainMenu;
+            }
             PauseMenuAction::Quit => {
+                self.save_active_world();
                 self.quit_requested = true;
+            }
+        }
+
+        match main_action {
+            MainMenuAction::None => {}
+            MainMenuAction::OpenWorldSelect => {
+                self.main_menu.refresh_worlds();
+                self.app_state = AppState::WorldSelect;
+            }
+            MainMenuAction::OpenOptions => {
+                self.main_menu.options_open = true;
+            }
+            MainMenuAction::Quit => {
+                self.quit_requested = true;
+            }
+            MainMenuAction::BackToMain => {
+                self.app_state = AppState::MainMenu;
+            }
+            MainMenuAction::OpenWorldCreate => {
+                self.app_state = AppState::WorldCreate;
+            }
+            MainMenuAction::PlayWorld(folder) => {
+                self.load_saved_world(folder);
+            }
+            MainMenuAction::DeleteWorld(folder) => {
+                if let Err(err) = delete_world(&folder) {
+                    log::error!("[Save] Failed to delete world '{}': {}", folder, err);
+                }
+                self.main_menu.refresh_worlds();
+            }
+            MainMenuAction::CreateWorld {
+                name,
+                seed_text,
+                creative,
+            } => {
+                self.start_new_world(name, seed_text, creative);
             }
         }
 
@@ -908,6 +1111,13 @@ pub async fn run() {
     let mut engine = Engine {
         window,
         gpu,
+        app_state: AppState::MainMenu,
+        main_menu: MainMenuState::new(),
+        active_world_folder: None,
+        active_world_name: "New Industrial World".to_string(),
+        active_world_seed: 0,
+        active_world_creative: true,
+        autosave_accum: 0.0,
         camera: Camera::new(initial_size.width as f32 / initial_size.height.max(1) as f32),
         camera_ctrl: CameraController::new(),
         sky: SkyState::new(),
@@ -949,6 +1159,9 @@ pub async fn run() {
                 {
                     match wev {
                         WindowEvent::CloseRequested => {
+                            if matches!(engine.app_state, AppState::InGame | AppState::Paused) {
+                                engine.save_active_world();
+                            }
                             log::info!("Close requested.");
                             elwt.exit();
                         }

@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use glam::{IVec3, Vec3};
+use serde::{Deserialize, Serialize};
 
 use crate::voxel::chunk::{
     is_fluid, is_solid_block, BlockId, AIR, COBBLESTONE, FIRE, LAVA, OBSIDIAN, OIL, WATER,
@@ -46,7 +47,7 @@ const ALL_DIRS: [IVec3; 6] = [
     IVec3::new(0, 0, -1),
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FluidCell {
     pub kind: BlockId,
     pub level: u8,
@@ -72,6 +73,21 @@ impl FluidSimulator {
 
     pub fn loaded_fluid_count(&self) -> usize {
         self.cells.len()
+    }
+
+    pub fn export_cells(&self) -> Vec<([i32; 3], FluidCell)> {
+        self.cells.iter().map(|(p, &c)| (p.to_array(), c)).collect()
+    }
+
+    pub fn import_cells(&mut self, saved: Vec<([i32; 3], FluidCell)>) {
+        self.cells.clear();
+        self.queue.clear();
+        self.queued.clear();
+        for (p, c) in saved {
+            let pos = IVec3::from_array(p);
+            self.cells.insert(pos, c);
+            self.enqueue(pos);
+        }
     }
 
     /// Returns the fluid decay level (`1..=8`) at `pos`, used by the mesher for proportional height.

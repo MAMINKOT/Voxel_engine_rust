@@ -222,7 +222,7 @@ fn shade_voxel(in: VertexOutput) -> vec4<f32> {
     }
 
     // Sample unconditionally in uniform control flow, then apply if `tex_layer != 0xFFFFFFFFu`
-    let safe_layer = min(sampled_layer, 83u);
+    let safe_layer = min(sampled_layer, 108u);
     let tex_color = textureSample(t_diffuse, s_diffuse, uv, i32(safe_layer));
     let has_texture = in.tex_layer != 0xFFFFFFFFu;
 

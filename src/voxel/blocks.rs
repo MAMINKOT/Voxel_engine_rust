@@ -2,10 +2,14 @@
 // and per-face block-to-texture mapping (`get_face_texture`).
 
 use crate::voxel::chunk::{
-    base_block_id, block_color, facing_from_id, is_active_block, BlockId, ALLOY_SMELTER, BATBOX,
-    BEDROCK, CABLE, CHEST, COAL_GENERATOR, COAL_ORE, COBBLESTONE, COPPER_ORE, DIRT,
-    ELECTRIC_FURNACE, FIRE, GRASS, IRON_ORE, LAVA, OAK_LEAVES, OBSIDIAN, OIL,
-    PURPLE_STAINED_GLASS, SIMPLE_FURNACE, STONE, TIN_ORE, TNT, TORCH, WATER, WOOD, WORKBENCH,
+    base_block_id, block_color, facing_from_id, is_active_block, BlockId, ACACIA_PLANKS,
+    ALLOY_SMELTER, ANDESITE, BATBOX, BEDROCK, BIRCH_PLANKS, BLACK_STAINED_GLASS,
+    BLUE_STAINED_GLASS, BOOKSHELF, CABLE, CHEST, COAL_GENERATOR, COAL_ORE, COBBLESTONE,
+    COPPER_ORE, DANDELION, DARK_OAK_PLANKS, DEAD_BUSH, DIORITE, DIRT, ELECTRIC_FURNACE, FIRE,
+    GRANITE, GRASS, GREEN_STAINED_GLASS, IRON_ORE, JUNGLE_PLANKS, LAVA, MOSSY_COBBLESTONE,
+    OAK_LEAVES, OAK_PLANKS, OBSIDIAN, OIL, PURPLE_STAINED_GLASS, RED_STAINED_GLASS, ROSE, SAND,
+    SANDSTONE, SIMPLE_FURNACE, SPRUCE_PLANKS, STONE, TALL_GRASS, TIN_ORE, TNT, TORCH, WATER, WOOD,
+    WORKBENCH, YELLOW_STAINED_GLASS,
 };
 
 /// Sentinel value in `Vertex::tex_layer` indicating an untextured vertex-colored surface
@@ -21,9 +25,10 @@ pub const FIRE_FRAMES: u32 = 32;
 ///   - `0..32`: base static textures + frame 0 of lava/fire
 ///   - `32..52`: 20 animation frames of `lava_still.png`
 ///   - `52..84`: 32 animation frames of `fire_layer_0.png`
-pub const TOTAL_LAYERS: u32 = FIRE_ANIM_START + FIRE_FRAMES;
+///   - `84..109`: Step 17 blocks (Bedrock, Stone variants, Wood Planks, Sandstone, Bookshelf, Stained Glass, Foliage)
+pub const TOTAL_LAYERS: u32 = 109;
 
-/// Sequence of 16x16 base layers in the GPU 2D Texture Array (`0..32`).
+/// Sequence of 16x16 base layers in the GPU 2D Texture Array (`0..32`, plus `84..109`).
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextureLayer {
@@ -59,6 +64,32 @@ pub enum TextureLayer {
     TorchOn = 29,
     FireLayer0 = 30,
     GlassMagenta = 31,
+
+    // Step 17 layers (84..109)
+    Bedrock = 84,
+    Granite = 85,
+    Diorite = 86,
+    Andesite = 87,
+    OakPlanks = 88,
+    BirchPlanks = 89,
+    SprucePlanks = 90,
+    JunglePlanks = 91,
+    AcaciaPlanks = 92,
+    DarkOakPlanks = 93,
+    SandstoneTop = 94,
+    SandstoneBottom = 95,
+    SandstoneSide = 96,
+    Bookshelf = 97,
+    MossyCobblestone = 98,
+    GlassBlack = 99,
+    GlassRed = 100,
+    GlassBlue = 101,
+    GlassGreen = 102,
+    GlassYellow = 103,
+    TallGrass = 104,
+    Rose = 105,
+    Dandelion = 106,
+    DeadBush = 107,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,19 +323,49 @@ pub fn get_face_texture(block_id: BlockId, face: BlockFace, is_active: bool) -> 
             BlockFace::PosY | BlockFace::NegY => TextureLayer::LogOakTop as u32,
             _ => TextureLayer::LogOakSide as u32,
         },
+        SANDSTONE => match face {
+            BlockFace::PosY => TextureLayer::SandstoneTop as u32,
+            BlockFace::NegY => TextureLayer::SandstoneBottom as u32,
+            _ => TextureLayer::SandstoneSide as u32,
+        },
+        BOOKSHELF => match face {
+            BlockFace::PosY | BlockFace::NegY => TextureLayer::OakPlanks as u32,
+            _ => TextureLayer::Bookshelf as u32,
+        },
         STONE => TextureLayer::Stone as u32,
+        GRANITE => TextureLayer::Granite as u32,
+        DIORITE => TextureLayer::Diorite as u32,
+        ANDESITE => TextureLayer::Andesite as u32,
+        OAK_PLANKS => TextureLayer::OakPlanks as u32,
+        BIRCH_PLANKS => TextureLayer::BirchPlanks as u32,
+        SPRUCE_PLANKS => TextureLayer::SprucePlanks as u32,
+        JUNGLE_PLANKS => TextureLayer::JunglePlanks as u32,
+        ACACIA_PLANKS => TextureLayer::AcaciaPlanks as u32,
+        DARK_OAK_PLANKS => TextureLayer::DarkOakPlanks as u32,
         DIRT => TextureLayer::Dirt as u32,
+        SAND => TextureLayer::Sand as u32,
         COBBLESTONE => TextureLayer::Cobblestone as u32,
+        MOSSY_COBBLESTONE => TextureLayer::MossyCobblestone as u32,
         IRON_ORE | COPPER_ORE | TIN_ORE => TextureLayer::IronOre as u32,
         COAL_ORE => TextureLayer::CoalOre as u32,
         BATBOX => TextureLayer::IronBlock as u32,
-        OBSIDIAN | BEDROCK => TextureLayer::Obsidian as u32,
+        OBSIDIAN => TextureLayer::Obsidian as u32,
+        BEDROCK => TextureLayer::Bedrock as u32,
         OAK_LEAVES => TextureLayer::LeavesOak as u32,
         PURPLE_STAINED_GLASS => TextureLayer::GlassMagenta as u32,
+        BLACK_STAINED_GLASS => TextureLayer::GlassBlack as u32,
+        RED_STAINED_GLASS => TextureLayer::GlassRed as u32,
+        BLUE_STAINED_GLASS => TextureLayer::GlassBlue as u32,
+        GREEN_STAINED_GLASS => TextureLayer::GlassGreen as u32,
+        YELLOW_STAINED_GLASS => TextureLayer::GlassYellow as u32,
+        TALL_GRASS => TextureLayer::TallGrass as u32,
+        ROSE => TextureLayer::Rose as u32,
+        DANDELION => TextureLayer::Dandelion as u32,
+        DEAD_BUSH => TextureLayer::DeadBush as u32,
         LAVA => TextureLayer::LavaStill as u32,
         TORCH => TextureLayer::TorchOn as u32,
         FIRE => TextureLayer::FireLayer0 as u32,
-        CHEST => TextureLayer::LogOakSide as u32,
+        CHEST => TextureLayer::OakPlanks as u32,
         CABLE | WATER | OIL => NO_TEXTURE,
         _ => NO_TEXTURE,
     }
@@ -316,12 +377,15 @@ pub fn get_face_texture(block_id: BlockId, face: BlockFace, is_active: bool) -> 
 pub fn texture_tint_color(raw_id: BlockId, axis: usize) -> [f32; 3] {
     let base = base_block_id(raw_id);
     match base {
-        STONE | DIRT | GRASS | COBBLESTONE | COAL_ORE | IRON_ORE | OBSIDIAN | OAK_LEAVES
-        | WOOD | WORKBENCH | SIMPLE_FURNACE | TNT | LAVA | TORCH | FIRE
-        | PURPLE_STAINED_GLASS => [1.0, 1.0, 1.0],
+        STONE | GRANITE | DIORITE | ANDESITE | DIRT | GRASS | SAND | SANDSTONE | COBBLESTONE
+        | MOSSY_COBBLESTONE | COAL_ORE | IRON_ORE | OBSIDIAN | BEDROCK | OAK_LEAVES | WOOD
+        | OAK_PLANKS | BIRCH_PLANKS | SPRUCE_PLANKS | JUNGLE_PLANKS | ACACIA_PLANKS
+        | DARK_OAK_PLANKS | BOOKSHELF | WORKBENCH | SIMPLE_FURNACE | TNT | LAVA | TORCH | FIRE
+        | PURPLE_STAINED_GLASS | BLACK_STAINED_GLASS | RED_STAINED_GLASS | BLUE_STAINED_GLASS
+        | GREEN_STAINED_GLASS | YELLOW_STAINED_GLASS | TALL_GRASS | ROSE | DANDELION
+        | DEAD_BUSH => [1.0, 1.0, 1.0],
         COPPER_ORE => [1.0, 0.72, 0.48],
         TIN_ORE => [0.85, 0.92, 1.0],
-        BEDROCK => [0.42, 0.42, 0.46],
         CHEST => [0.92, 0.72, 0.46],
         COAL_GENERATOR => [0.82, 0.78, 0.74],
         ELECTRIC_FURNACE => [0.82, 0.90, 1.05],

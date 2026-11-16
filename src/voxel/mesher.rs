@@ -10,9 +10,10 @@ use crate::voxel::blocks::{
     NO_TEXTURE,
 };
 use crate::voxel::chunk::{
-    base_block_id, block_face_color, fluid_level_from_id, is_active_block, is_energy_connectable,
-    is_fluid, is_full_cube, is_solid_block, is_translucent, BlockId, AIR, CABLE, CABLE_MAX,
-    CABLE_MIN, CHUNK_SIZE, FIRE, GRASS, LAVA, OAK_LEAVES, PURPLE_STAINED_GLASS, TORCH, WATER,
+    base_block_id, block_face_color, fluid_level_from_id, is_active_block, is_cross_foliage,
+    is_energy_connectable, is_fluid, is_full_cube, is_solid_block, is_stained_glass,
+    is_translucent, BlockId, AIR, CABLE, CABLE_MAX, CABLE_MIN, CHUNK_SIZE, FIRE, GRASS, LAVA,
+    OAK_LEAVES, TORCH, WATER,
 };
 use crate::voxel::light::{
     blue_channel, green_channel, light_to_f32_array, pack_light, red_channel, sun_channel,
@@ -245,8 +246,10 @@ where
                     emit_cable(&mut opaque, wp, x, y, z, cell_light, &sample);
                 } else if base == TORCH {
                     emit_torch(&mut opaque, wp);
-                } else if base == PURPLE_STAINED_GLASS {
-                    emit_stained_glass(&mut translucent, wp, x, y, z, cell_light, &sample);
+                } else if is_cross_foliage(base) {
+                    emit_cross_foliage_voxel(&mut opaque, wp, raw, cell_light);
+                } else if is_stained_glass(base) {
+                    emit_stained_glass(&mut translucent, wp, x, y, z, raw, cell_light, &sample);
                 } else if is_fluid(base) {
                     let target_mesh = if is_translucent(base) {
                         &mut translucent
@@ -684,19 +687,75 @@ fn emit_torch(data: &mut MeshData, world_pos: IVec3) {
     }
 }
 
-/// Emits a translucent `PURPLE_STAINED_GLASS` block, culling faces shared with adjacent glass or opaque cubes.
+/// Emits Cross-Mesh Foliage (`TallGrass`, `Rose`, `Dandelion`, `DeadBush`) as two crossed
+/// diagonal planes inside the voxel, emitted double-sided so both faces render cleanly.
+fn emit_cross_foliage_voxel(
+    data: &mut MeshData,
+    world_pos: IVec3,
+    raw: BlockId,
+    light: [f32; 4],
+) {
+    let b = world_pos.as_vec3();
+    let (x0, y0, z0) = (b.x + 0.08, b.y, b.z + 0.08);
+    let (x1, y1, z1) = (b.x + 0.92, b.y + 0.88, b.z + 0.92);
+    const FOLIAGE_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let tex_layer = get_face_texture(raw, BlockFace::PosZ, false);
+
+    let planes: [([[f32; 3]; 4], [f32; 3]); 4] = [
+        // Diagonal A front & back
+        (
+            [[x0, y0, z0], [x1, y0, z1], [x1, y1, z1], [x0, y1, z0]],
+            [0.707, 0.0, -0.707],
+        ),
+        (
+            [[x1, y0, z1], [x0, y0, z0], [x0, y1, z0], [x1, y1, z1]],
+            [-0.707, 0.0, 0.707],
+        ),
+        // Diagonal B front & back
+        (
+            [[x0, y0, z1], [x1, y0, z0], [x1, y1, z0], [x0, y1, z1]],
+            [0.707, 0.0, 0.707],
+        ),
+        (
+            [[x1, y0, z0], [x0, y0, z1], [x0, y1, z1], [x1, y1, z0]],
+            [-0.707, 0.0, -0.707],
+        ),
+    ];
+
+    for (corners, normal) in planes {
+        let base = data.vertices.len() as u32;
+        for (idx, position) in corners.into_iter().enumerate() {
+            data.vertices.push(Vertex {
+                position,
+                normal,
+                color: [1.0, 1.0, 1.0],
+                light,
+                ao_and_flags: [3.0, MAT_STANDARD],
+                uv: FOLIAGE_UVS[idx],
+                tex_layer,
+            });
+        }
+        data.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
+/// Emits a translucent stained-glass block, culling faces shared with adjacent same-color glass or opaque cubes.
+#[allow(clippy::too_many_arguments)]
 fn emit_stained_glass<F: Fn(i32, i32, i32) -> BlockId>(
     data: &mut MeshData,
     world_pos: IVec3,
     lx: i32,
     ly: i32,
     lz: i32,
+    raw: BlockId,
     light: [f32; 4],
     sample: &F,
 ) {
+    let self_base = base_block_id(raw);
     let vis = |nx: i32, ny: i32, nz: i32| -> bool {
         let nb = sample(nx, ny, nz);
-        !is_full_cube(nb) && base_block_id(nb) != PURPLE_STAINED_GLASS
+        !is_full_cube(nb) && base_block_id(nb) != self_base
     };
     let faces = [
         vis(lx + 1, ly, lz),
@@ -707,6 +766,7 @@ fn emit_stained_glass<F: Fn(i32, i32, i32) -> BlockId>(
         vis(lx, ly, lz - 1),
     ];
     let bmin = world_pos.as_vec3();
+    let tex_layer = get_face_texture(raw, BlockFace::PosZ, false);
     emit_box_with_custom_top_ao(
         data,
         bmin,
@@ -715,7 +775,7 @@ fn emit_stained_glass<F: Fn(i32, i32, i32) -> BlockId>(
         light,
         3.0,
         MAT_STAINED_GLASS,
-        TextureLayer::GlassMagenta as u32,
+        tex_layer,
         faces,
     );
 }

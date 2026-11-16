@@ -50,7 +50,7 @@ impl BlockTextureArray {
             view_formats: &[],
         });
 
-        let layer_specs: [(TextureLayer, &str); 32] = [
+        let layer_specs: [(TextureLayer, &str); 56] = [
             (TextureLayer::Stone, "stone.png"),
             (TextureLayer::Dirt, "dirt.png"),
             (TextureLayer::GrassTop, "grass_top.png"),
@@ -83,12 +83,37 @@ impl BlockTextureArray {
             (TextureLayer::TorchOn, "torch_on.png"),
             (TextureLayer::FireLayer0, "fire_layer_0.png"),
             (TextureLayer::GlassMagenta, "glass_magenta.png"),
+            // Step 17 layers (84..108)
+            (TextureLayer::Bedrock, "bedrock.png"),
+            (TextureLayer::Granite, "stone_granite.png"),
+            (TextureLayer::Diorite, "stone_diorite.png"),
+            (TextureLayer::Andesite, "stone_andesite.png"),
+            (TextureLayer::OakPlanks, "planks_oak.png"),
+            (TextureLayer::BirchPlanks, "planks_birch.png"),
+            (TextureLayer::SprucePlanks, "planks_spruce.png"),
+            (TextureLayer::JunglePlanks, "planks_jungle.png"),
+            (TextureLayer::AcaciaPlanks, "planks_acacia.png"),
+            (TextureLayer::DarkOakPlanks, "planks_big_oak.png"),
+            (TextureLayer::SandstoneTop, "sandstone_top.png"),
+            (TextureLayer::SandstoneBottom, "sandstone_bottom.png"),
+            (TextureLayer::SandstoneSide, "sandstone_normal.png"),
+            (TextureLayer::Bookshelf, "bookshelf.png"),
+            (TextureLayer::MossyCobblestone, "cobblestone_mossy.png"),
+            (TextureLayer::GlassBlack, "glass_black.png"),
+            (TextureLayer::GlassRed, "glass_red.png"),
+            (TextureLayer::GlassBlue, "glass_blue.png"),
+            (TextureLayer::GlassGreen, "glass_green.png"),
+            (TextureLayer::GlassYellow, "glass_yellow.png"),
+            (TextureLayer::TallGrass, "tallgrass.png"),
+            (TextureLayer::Rose, "flower_rose.png"),
+            (TextureLayer::Dandelion, "flower_dandelion.png"),
+            (TextureLayer::DeadBush, "deadbush.png"),
         ];
 
         for (layer, filename) in layer_specs {
             let mut img = load_normalized_16x16(&base_dir.join(filename));
             match layer {
-                TextureLayer::GrassTop | TextureLayer::LeavesOak => {
+                TextureLayer::GrassTop | TextureLayer::LeavesOak | TextureLayer::TallGrass => {
                     tint_rgba_in_place(&mut img, FOLIAGE_TINT);
                 }
                 TextureLayer::GrassSide => {
@@ -355,6 +380,7 @@ pub fn build_ui_item_icons() -> HashMap<BlockId, egui::ColorImage> {
             2 => Some("grass_top.png"),
             3 => Some("grass_side.png"),
             4 => Some("cobblestone.png"),
+            6 => Some("sand.png"),
             8 => Some("iron_ore.png"),
             9 => Some("coal_ore.png"),
             10 => Some("iron_block.png"),
@@ -369,6 +395,28 @@ pub fn build_ui_item_icons() -> HashMap<BlockId, egui::ColorImage> {
             29 => Some("torch_on.png"),
             30 => Some("fire_layer_0.png"),
             31 => Some("glass_magenta.png"),
+            84 => Some("bedrock.png"),
+            85 => Some("stone_granite.png"),
+            86 => Some("stone_diorite.png"),
+            87 => Some("stone_andesite.png"),
+            88 => Some("planks_oak.png"),
+            89 => Some("planks_birch.png"),
+            90 => Some("planks_spruce.png"),
+            91 => Some("planks_jungle.png"),
+            92 => Some("planks_acacia.png"),
+            93 => Some("planks_big_oak.png"),
+            96 => Some("sandstone_normal.png"),
+            97 => Some("bookshelf.png"),
+            98 => Some("cobblestone_mossy.png"),
+            99 => Some("glass_black.png"),
+            100 => Some("glass_red.png"),
+            101 => Some("glass_blue.png"),
+            102 => Some("glass_green.png"),
+            103 => Some("glass_yellow.png"),
+            104 => Some("tallgrass.png"),
+            105 => Some("flower_rose.png"),
+            106 => Some("flower_dandelion.png"),
+            107 => Some("deadbush.png"),
             _ => None,
         }
     };
@@ -378,7 +426,10 @@ pub fn build_ui_item_icons() -> HashMap<BlockId, egui::ColorImage> {
         let rgba: RgbaImage = if layer != NO_TEXTURE {
             if let Some(filename) = layer_file(layer) {
                 let mut img = load_normalized_16x16(&base_dir.join(filename));
-                if layer == TextureLayer::LeavesOak as u32 || layer == TextureLayer::GrassTop as u32 {
+                if layer == TextureLayer::LeavesOak as u32
+                    || layer == TextureLayer::GrassTop as u32
+                    || layer == TextureLayer::TallGrass as u32
+                {
                     tint_rgba_in_place(&mut img, FOLIAGE_TINT);
                 } else if layer == TextureLayer::GrassSide as u32 {
                     let mut overlay =

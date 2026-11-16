@@ -44,13 +44,54 @@ pub const PURPLE_STAINED_GLASS: BlockId = 31;
 pub const WOOD: BlockId = 32;
 pub const BEDROCK: BlockId = 33;
 
-pub const ALL_ITEMS: [BlockId; 33] = [
+// Step 17: Stone variants, Wood Planks, Sandstone, Bookshelf, Mossy Cobble, Stained Glass & Cross Foliage
+pub const GRANITE: BlockId = 34;
+pub const DIORITE: BlockId = 35;
+pub const ANDESITE: BlockId = 36;
+pub const OAK_PLANKS: BlockId = 37;
+pub const BIRCH_PLANKS: BlockId = 38;
+pub const SPRUCE_PLANKS: BlockId = 39;
+pub const JUNGLE_PLANKS: BlockId = 40;
+pub const ACACIA_PLANKS: BlockId = 41;
+pub const DARK_OAK_PLANKS: BlockId = 42;
+pub const SANDSTONE: BlockId = 43;
+pub const BOOKSHELF: BlockId = 44;
+pub const MOSSY_COBBLESTONE: BlockId = 45;
+pub const BLACK_STAINED_GLASS: BlockId = 46;
+pub const RED_STAINED_GLASS: BlockId = 47;
+pub const BLUE_STAINED_GLASS: BlockId = 48;
+pub const GREEN_STAINED_GLASS: BlockId = 49;
+pub const YELLOW_STAINED_GLASS: BlockId = 50;
+pub const TALL_GRASS: BlockId = 51;
+pub const ROSE: BlockId = 52;
+pub const DANDELION: BlockId = 53;
+pub const DEAD_BUSH: BlockId = 54;
+pub const SAND: BlockId = 55;
+
+pub const ALL_ITEMS: [BlockId; 55] = [
     STONE,
+    GRANITE,
+    DIORITE,
+    ANDESITE,
     COBBLESTONE,
+    MOSSY_COBBLESTONE,
     DIRT,
     GRASS,
+    SAND,
+    SANDSTONE,
     WOOD,
+    OAK_PLANKS,
+    BIRCH_PLANKS,
+    SPRUCE_PLANKS,
+    JUNGLE_PLANKS,
+    ACACIA_PLANKS,
+    DARK_OAK_PLANKS,
+    BOOKSHELF,
     OAK_LEAVES,
+    TALL_GRASS,
+    ROSE,
+    DANDELION,
+    DEAD_BUSH,
     OBSIDIAN,
     BEDROCK,
     COAL_ORE,
@@ -72,6 +113,11 @@ pub const ALL_ITEMS: [BlockId; 33] = [
     ALLOY_SMELTER,
     TORCH,
     PURPLE_STAINED_GLASS,
+    BLACK_STAINED_GLASS,
+    RED_STAINED_GLASS,
+    BLUE_STAINED_GLASS,
+    GREEN_STAINED_GLASS,
+    YELLOW_STAINED_GLASS,
     WATER,
     LAVA,
     OIL,
@@ -130,18 +176,41 @@ pub fn is_fluid(id: BlockId) -> bool {
     matches!(base_block_id(id), WATER | LAVA | OIL)
 }
 
-/// True if `id` is rendered in the translucent alpha-blended pass (`Water`, `Fire`, `PurpleStainedGlass`).
+/// True if `id` is a cross-mesh foliage block (`TallGrass`, `Rose`, `Dandelion`, `DeadBush`).
+#[inline]
+pub fn is_cross_foliage(id: BlockId) -> bool {
+    matches!(
+        base_block_id(id),
+        TALL_GRASS | ROSE | DANDELION | DEAD_BUSH
+    )
+}
+
+/// True if `id` is any colored stained glass block.
+#[inline]
+pub fn is_stained_glass(id: BlockId) -> bool {
+    matches!(
+        base_block_id(id),
+        PURPLE_STAINED_GLASS
+            | BLACK_STAINED_GLASS
+            | RED_STAINED_GLASS
+            | BLUE_STAINED_GLASS
+            | GREEN_STAINED_GLASS
+            | YELLOW_STAINED_GLASS
+    )
+}
+
+/// True if `id` is rendered in the translucent alpha-blended pass (`Water`, `Fire`, Stained Glass).
 #[inline]
 pub fn is_translucent(id: BlockId) -> bool {
-    matches!(base_block_id(id), WATER | FIRE | PURPLE_STAINED_GLASS)
+    matches!(base_block_id(id), WATER | FIRE) || is_stained_glass(id)
 }
 
 /// True if `id` blocks physical movement (AABB collisions).
-/// Air, fluids (`Water`, `Lava`, `Oil`), `Fire`, and `Torch` are non-solid (passable).
+/// Air, fluids (`Water`, `Lava`, `Oil`), `Fire`, `Torch`, and cross-mesh foliage are passable.
 #[inline]
 pub fn is_solid_block(id: BlockId) -> bool {
     let base = base_block_id(id);
-    base != AIR && !is_fluid(base) && base != FIRE && base != TORCH
+    base != AIR && !is_fluid(base) && base != FIRE && base != TORCH && !is_cross_foliage(base)
 }
 
 /// True if `id` resists TNT explosions (`Bedrock` and `Obsidian`).
@@ -153,7 +222,20 @@ pub fn is_blast_resistant(id: BlockId) -> bool {
 /// True if `id` can catch fire or be consumed by neighboring `Fire`.
 #[inline]
 pub fn is_flammable(id: BlockId) -> bool {
-    matches!(base_block_id(id), WOOD | OAK_LEAVES | OIL)
+    matches!(
+        base_block_id(id),
+        WOOD | OAK_PLANKS
+            | BIRCH_PLANKS
+            | SPRUCE_PLANKS
+            | JUNGLE_PLANKS
+            | ACACIA_PLANKS
+            | DARK_OAK_PLANKS
+            | BOOKSHELF
+            | OAK_LEAVES
+            | OIL
+            | TALL_GRASS
+            | DEAD_BUSH
+    )
 }
 
 /// True if `id` can be placed in the world as a voxel block.
@@ -161,11 +243,28 @@ pub fn is_placeable(id: BlockId) -> bool {
     matches!(
         base_block_id(id),
         STONE
+            | GRANITE
+            | DIORITE
+            | ANDESITE
             | COBBLESTONE
+            | MOSSY_COBBLESTONE
             | DIRT
             | GRASS
+            | SAND
+            | SANDSTONE
             | WOOD
+            | OAK_PLANKS
+            | BIRCH_PLANKS
+            | SPRUCE_PLANKS
+            | JUNGLE_PLANKS
+            | ACACIA_PLANKS
+            | DARK_OAK_PLANKS
+            | BOOKSHELF
             | OAK_LEAVES
+            | TALL_GRASS
+            | ROSE
+            | DANDELION
+            | DEAD_BUSH
             | OBSIDIAN
             | BEDROCK
             | COAL_ORE
@@ -182,6 +281,11 @@ pub fn is_placeable(id: BlockId) -> bool {
             | SIMPLE_FURNACE
             | TORCH
             | PURPLE_STAINED_GLASS
+            | BLACK_STAINED_GLASS
+            | RED_STAINED_GLASS
+            | BLUE_STAINED_GLASS
+            | GREEN_STAINED_GLASS
+            | YELLOW_STAINED_GLASS
             | WATER
             | LAVA
             | OIL
@@ -191,11 +295,16 @@ pub fn is_placeable(id: BlockId) -> bool {
 }
 
 /// True if the block occupies an opaque full 1x1x1 voxel cell (occludes neighbour faces).
-/// Cables, torches, variable-height fluids, and translucent blocks do not occlude solid faces.
+/// Cables, torches, variable-height fluids, cross foliage, and translucent blocks do not occlude solid faces.
 #[inline]
 pub fn is_full_cube(id: BlockId) -> bool {
     let base = base_block_id(id);
-    base != AIR && base != CABLE && base != TORCH && !is_fluid(base) && !is_translucent(base)
+    base != AIR
+        && base != CABLE
+        && base != TORCH
+        && !is_fluid(base)
+        && !is_translucent(base)
+        && !is_cross_foliage(base)
 }
 
 /// True if a cable arm should visually and electrically connect to `id`.
@@ -246,6 +355,28 @@ pub fn block_name(id: BlockId) -> &'static str {
         PURPLE_STAINED_GLASS => "Purple Stained Glass",
         WOOD => "Oak Wood Log",
         BEDROCK => "Bedrock",
+        GRANITE => "Granite",
+        DIORITE => "Diorite",
+        ANDESITE => "Andesite",
+        OAK_PLANKS => "Oak Planks",
+        BIRCH_PLANKS => "Birch Planks",
+        SPRUCE_PLANKS => "Spruce Planks",
+        JUNGLE_PLANKS => "Jungle Planks",
+        ACACIA_PLANKS => "Acacia Planks",
+        DARK_OAK_PLANKS => "Dark Oak Planks",
+        SANDSTONE => "Sandstone",
+        BOOKSHELF => "Bookshelf",
+        MOSSY_COBBLESTONE => "Mossy Cobblestone",
+        BLACK_STAINED_GLASS => "Black Stained Glass",
+        RED_STAINED_GLASS => "Red Stained Glass",
+        BLUE_STAINED_GLASS => "Blue Stained Glass",
+        GREEN_STAINED_GLASS => "Green Stained Glass",
+        YELLOW_STAINED_GLASS => "Yellow Stained Glass",
+        TALL_GRASS => "Tall Grass",
+        ROSE => "Rose",
+        DANDELION => "Dandelion",
+        DEAD_BUSH => "Dead Bush",
+        SAND => "Sand",
         _ => "Unknown",
     }
 }
@@ -286,6 +417,28 @@ pub fn block_color(id: BlockId) -> [f32; 3] {
         PURPLE_STAINED_GLASS => [0.65, 0.16, 0.88], // rich purple stained glass
         WOOD => [0.54, 0.36, 0.18],                 // timber brown log
         BEDROCK => [0.15, 0.15, 0.17],              // unbreakable dark bedrock
+        GRANITE => [0.62, 0.44, 0.38],
+        DIORITE => [0.78, 0.78, 0.78],
+        ANDESITE => [0.56, 0.56, 0.58],
+        OAK_PLANKS => [0.68, 0.52, 0.30],
+        BIRCH_PLANKS => [0.80, 0.74, 0.52],
+        SPRUCE_PLANKS => [0.45, 0.32, 0.19],
+        JUNGLE_PLANKS => [0.66, 0.48, 0.34],
+        ACACIA_PLANKS => [0.72, 0.40, 0.22],
+        DARK_OAK_PLANKS => [0.28, 0.19, 0.11],
+        SANDSTONE => [0.85, 0.80, 0.62],
+        BOOKSHELF => [0.60, 0.42, 0.24],
+        MOSSY_COBBLESTONE => [0.36, 0.48, 0.34],
+        BLACK_STAINED_GLASS => [0.15, 0.15, 0.18],
+        RED_STAINED_GLASS => [0.82, 0.18, 0.18],
+        BLUE_STAINED_GLASS => [0.20, 0.32, 0.85],
+        GREEN_STAINED_GLASS => [0.26, 0.60, 0.22],
+        YELLOW_STAINED_GLASS => [0.88, 0.82, 0.22],
+        TALL_GRASS => [0.34, 0.68, 0.20],
+        ROSE => [0.86, 0.18, 0.18],
+        DANDELION => [0.95, 0.85, 0.18],
+        DEAD_BUSH => [0.58, 0.42, 0.22],
+        SAND => [0.88, 0.84, 0.64],
         _ => [1.0, 0.0, 1.0],
     }
 }
@@ -365,6 +518,8 @@ pub struct Chunk {
     blocks: Box<[BlockId; CHUNK_VOLUME]>,
     /// Per-voxel metadata (`0..=3` in lower 2 bits = Facing: 0=North(-Z), 1=East(+X), 2=South(+Z), 3=West(-X)).
     metadata: Box<[u8; CHUNK_VOLUME]>,
+    /// True when the chunk was modified after procedural generation (needs saving to disk).
+    pub is_dirty: bool,
 }
 
 impl Chunk {
@@ -378,7 +533,36 @@ impl Chunk {
             .into_boxed_slice()
             .try_into()
             .expect("chunk metadata size mismatch");
-        Self { blocks, metadata }
+        Self {
+            blocks,
+            metadata,
+            is_dirty: false,
+        }
+    }
+
+    pub fn from_raw(blocks_vec: Vec<u16>, meta_vec: Vec<u8>) -> Option<Self> {
+        if blocks_vec.len() != CHUNK_VOLUME {
+            return None;
+        }
+        let blocks: Box<[BlockId; CHUNK_VOLUME]> = blocks_vec.into_boxed_slice().try_into().ok()?;
+        let metadata: Box<[u8; CHUNK_VOLUME]> = if meta_vec.len() == CHUNK_VOLUME {
+            meta_vec.into_boxed_slice().try_into().ok()?
+        } else {
+            vec![0u8; CHUNK_VOLUME].into_boxed_slice().try_into().ok()?
+        };
+        Some(Self {
+            blocks,
+            metadata,
+            is_dirty: true,
+        })
+    }
+
+    pub fn blocks_slice(&self) -> &[BlockId] {
+        &*self.blocks
+    }
+
+    pub fn metadata_slice(&self) -> &[u8] {
+        &*self.metadata
     }
 
     #[inline]

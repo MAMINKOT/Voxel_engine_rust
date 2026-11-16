@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use glam::IVec3;
+use serde::{Deserialize, Serialize};
 
 use crate::crafting::RecipeRegistry;
 use crate::inventory::{ItemStack, MAIN_INV_SIZE};
@@ -53,6 +54,7 @@ const NEIGHBORS: [IVec3; 6] = [
 
 // ─── Machines & Block Entities ───────────────────────────────────────────────
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Generator {
     pub fuel: u16,
     pub burn_ticks: u32,
@@ -87,6 +89,7 @@ impl Generator {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Furnace {
     pub input: Option<ItemStack>,
     pub output: Option<ItemStack>,
@@ -154,6 +157,7 @@ impl Furnace {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AlloySmelter {
     pub input_a: Option<ItemStack>,
     pub input_b: Option<ItemStack>,
@@ -225,6 +229,7 @@ impl AlloySmelter {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BatBox {
     pub stored_eu: u32,
     pub max_eu: u32,
@@ -243,6 +248,7 @@ impl Default for BatBox {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SimpleFurnace {
     pub input: Option<ItemStack>,
     pub fuel: u16,
@@ -310,6 +316,7 @@ impl SimpleFurnace {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Chest {
     pub slots: [Option<ItemStack>; MAIN_INV_SIZE],
 }
@@ -322,11 +329,21 @@ impl Default for Chest {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 enum Machine {
     Generator(Generator),
     Furnace(Furnace),
     AlloySmelter(AlloySmelter),
     BatBox(BatBox),
+}
+
+#[derive(Default, Serialize, Deserialize)]
+pub struct SavedEnergyState {
+    machines: Vec<([i32; 3], Machine)>,
+    simple_furnaces: Vec<([i32; 3], SimpleFurnace)>,
+    chests: Vec<([i32; 3], Vec<Option<ItemStack>>)>,
+    workbenches: Vec<[i32; 3]>,
+    cables: Vec<[i32; 3]>,
 }
 
 impl Machine {
@@ -382,6 +399,56 @@ impl EnergyNetwork {
             dirty: false,
             recipes: RecipeRegistry::new(),
         }
+    }
+
+    pub fn export_state(&self) -> SavedEnergyState {
+        SavedEnergyState {
+            machines: self
+                .machines
+                .iter()
+                .map(|(p, m)| (p.to_array(), m.clone()))
+                .collect(),
+            simple_furnaces: self
+                .simple_furnaces
+                .iter()
+                .map(|(p, f)| (p.to_array(), f.clone()))
+                .collect(),
+            chests: self
+                .chests
+                .iter()
+                .map(|(p, c)| (p.to_array(), c.slots.to_vec()))
+                .collect(),
+            workbenches: self.workbenches.iter().map(|p| p.to_array()).collect(),
+            cables: self.cables.iter().map(|p| p.to_array()).collect(),
+        }
+    }
+
+    pub fn import_state(&mut self, state: SavedEnergyState) {
+        self.machines.clear();
+        self.simple_furnaces.clear();
+        self.chests.clear();
+        self.workbenches.clear();
+        self.cables.clear();
+        for (p, m) in state.machines {
+            self.machines.insert(IVec3::from_array(p), m);
+        }
+        for (p, f) in state.simple_furnaces {
+            self.simple_furnaces.insert(IVec3::from_array(p), f);
+        }
+        for (p, slots_vec) in state.chests {
+            let mut slots = [None; MAIN_INV_SIZE];
+            for (i, s) in slots_vec.into_iter().take(MAIN_INV_SIZE).enumerate() {
+                slots[i] = s;
+            }
+            self.chests.insert(IVec3::from_array(p), Chest { slots });
+        }
+        for p in state.workbenches {
+            self.workbenches.insert(IVec3::from_array(p));
+        }
+        for p in state.cables {
+            self.cables.insert(IVec3::from_array(p));
+        }
+        self.dirty = true;
     }
 
     /// Must be called for every block change in the world.

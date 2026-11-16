@@ -23,7 +23,12 @@ use crate::inventory::{
 };
 use crate::render::texture::build_ui_item_icons;
 use crate::sim::energy_net::EnergyNetwork;
+use crate::state::AppState;
 use crate::ui::debug::{draw_debug_overlay, DebugInfo};
+use crate::ui::main_menu::{
+    draw_loading_screen, draw_main_menu, draw_world_create, draw_world_select, MainMenuAction,
+    MainMenuState,
+};
 use crate::ui::menu::{draw_options_menu, draw_pause_menu, GraphicsSettings, PauseMenuAction};
 use crate::voxel::chunk::{
     block_color, block_name, BlockId, ALL_ITEMS, ALLOY_SMELTER, BATBOX, CHEST, COAL_GENERATOR,
@@ -120,6 +125,22 @@ impl UiSystem {
         });
     }
 
+    pub fn on_text_input(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.events.push(EguiEvent::Text(text.to_string()));
+        }
+    }
+
+    pub fn on_egui_key(&mut self, key: Key, pressed: bool) {
+        self.events.push(EguiEvent::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -131,12 +152,14 @@ impl UiSystem {
         height: u32,
         scale_factor: f32,
         dt: f32,
+        app_state: &AppState,
+        main_menu: &mut MainMenuState,
         inventory: &mut PlayerInventory,
         energy: &mut EnergyNetwork,
         settings: &mut GraphicsSettings,
         debug_info: Option<&DebugInfo>,
         block_at: impl Fn(IVec3) -> BlockId,
-    ) -> PauseMenuAction {
+    ) -> (PauseMenuAction, MainMenuAction) {
         if let UiScreen::Machine(pos) = self.screen {
             if !energy.is_interactive(pos) {
                 self.screen = UiScreen::Closed;
@@ -163,36 +186,60 @@ impl UiSystem {
         let cursor_pos = self.cursor_pos;
         let mut nei_query = self.nei_query;
         let mut menu_action = PauseMenuAction::None;
+        let mut main_action = MainMenuAction::None;
 
         let full_output = self.ctx.run(raw_input, |ctx| {
-            if let Some(info) = debug_info {
-                draw_debug_overlay(ctx, info);
-            }
-
-            draw_hud_hotbar(ctx, inventory);
-
-            match screen {
-                UiScreen::Closed => {}
-                UiScreen::Inventory => {
-                    draw_inventory_window(ctx, inventory, &energy.recipes);
+            match app_state {
+                AppState::MainMenu => {
+                    if main_menu.options_open {
+                        let opt_act = draw_options_menu(ctx, settings);
+                        if opt_act == PauseMenuAction::BackToPause {
+                            main_menu.options_open = false;
+                        }
+                    } else {
+                        main_action = draw_main_menu(ctx);
+                    }
                 }
-                UiScreen::Machine(pos) => {
-                    let kind = block_at(pos);
-                    draw_machine_window(ctx, pos, kind, inventory, energy);
+                AppState::WorldSelect => {
+                    main_action = draw_world_select(ctx, main_menu);
                 }
-                UiScreen::PauseMenu => {
-                    menu_action = draw_pause_menu(ctx);
+                AppState::WorldCreate => {
+                    main_action = draw_world_create(ctx, main_menu);
                 }
-                UiScreen::OptionsMenu => {
-                    menu_action = draw_options_menu(ctx, settings);
+                AppState::Loading { progress, message } => {
+                    draw_loading_screen(ctx, *progress, message);
                 }
-            }
+                AppState::InGame | AppState::Paused => {
+                    if let Some(info) = debug_info {
+                        draw_debug_overlay(ctx, info);
+                    }
 
-            if matches!(screen, UiScreen::Inventory | UiScreen::Machine(_)) {
-                draw_nei_sidebar(ctx, &energy.recipes, inventory, &mut nei_query);
+                    draw_hud_hotbar(ctx, inventory);
 
-                if let Some(held) = inventory.cursor_item {
-                    draw_cursor_stack(ctx, cursor_pos, held);
+                    match screen {
+                        UiScreen::Closed => {}
+                        UiScreen::Inventory => {
+                            draw_inventory_window(ctx, inventory, &energy.recipes);
+                        }
+                        UiScreen::Machine(pos) => {
+                            let kind = block_at(pos);
+                            draw_machine_window(ctx, pos, kind, inventory, energy);
+                        }
+                        UiScreen::PauseMenu => {
+                            menu_action = draw_pause_menu(ctx);
+                        }
+                        UiScreen::OptionsMenu => {
+                            menu_action = draw_options_menu(ctx, settings);
+                        }
+                    }
+
+                    if matches!(screen, UiScreen::Inventory | UiScreen::Machine(_)) {
+                        draw_nei_sidebar(ctx, &energy.recipes, inventory, &mut nei_query);
+
+                        if let Some(held) = inventory.cursor_item {
+                            draw_cursor_stack(ctx, cursor_pos, held);
+                        }
+                    }
                 }
             }
         });
@@ -232,7 +279,7 @@ impl UiSystem {
             self.renderer.free_texture(id);
         }
 
-        menu_action
+        (menu_action, main_action)
     }
 }
 

@@ -81,6 +81,18 @@ impl Player {
         self.mode == MoveMode::Flying
     }
 
+    pub fn set_pose_and_mode(&mut self, pos: Vec3, flying: bool) {
+        self.position = pos;
+        self.velocity = Vec3::ZERO;
+        self.external_impulse = Vec3::ZERO;
+        self.on_ground = false;
+        self.mode = if flying {
+            MoveMode::Flying
+        } else {
+            MoveMode::Walking
+        };
+    }
+
     /// Resets horizontal (and flying vertical) velocity when opening a UI screen or losing window focus.
     pub fn reset_inputs(&mut self) {
         self.velocity.x = 0.0;

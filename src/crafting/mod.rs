@@ -3,10 +3,11 @@
 
 use crate::inventory::ItemStack;
 use crate::voxel::chunk::{
-    ALLOY_SMELTER, BATBOX, BRONZE_INGOT, CABLE, CHEST, COAL_GENERATOR, COAL_ORE, COBBLESTONE,
-    COPPER_INGOT, COPPER_ORE, DIRT, ELECTRIC_FURNACE, GRASS, IRON_INGOT, IRON_ORE, LIGHTER,
-    PURPLE_STAINED_GLASS, SIMPLE_FURNACE, STEEL_INGOT, STONE, TIN_INGOT, TIN_ORE, TNT, TORCH,
-    WOOD, WORKBENCH,
+    ACACIA_PLANKS, ALLOY_SMELTER, BATBOX, BIRCH_PLANKS, BOOKSHELF, BRONZE_INGOT, CABLE, CHEST,
+    COAL_GENERATOR, COAL_ORE, COBBLESTONE, COPPER_INGOT, COPPER_ORE, DARK_OAK_PLANKS, DIRT,
+    ELECTRIC_FURNACE, GRASS, IRON_INGOT, IRON_ORE, JUNGLE_PLANKS, LIGHTER, OAK_PLANKS,
+    PURPLE_STAINED_GLASS, SAND, SANDSTONE, SIMPLE_FURNACE, SPRUCE_PLANKS, STEEL_INGOT, STONE,
+    TIN_INGOT, TIN_ORE, TNT, TORCH, WOOD, WORKBENCH,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -93,6 +94,50 @@ impl RecipeRegistry {
                     Some(DIRT),     Some(COAL_ORE),
                 ],
                 output: ItemStack { id: TNT, count: 2 },
+            },
+            // 1 Oak Log -> 4 Oak Planks
+            Recipe::CraftingShapeless {
+                inputs: vec![WOOD],
+                output: ItemStack { id: OAK_PLANKS, count: 4 },
+            },
+            // Planks variants (craftable from Oak Planks + Stone/Sand/Coal/Iron dyes/variants)
+            Recipe::CraftingShapeless {
+                inputs: vec![OAK_PLANKS, SAND],
+                output: ItemStack { id: BIRCH_PLANKS, count: 2 },
+            },
+            Recipe::CraftingShapeless {
+                inputs: vec![OAK_PLANKS, DIRT],
+                output: ItemStack { id: SPRUCE_PLANKS, count: 2 },
+            },
+            Recipe::CraftingShapeless {
+                inputs: vec![OAK_PLANKS, COBBLESTONE],
+                output: ItemStack { id: JUNGLE_PLANKS, count: 2 },
+            },
+            Recipe::CraftingShapeless {
+                inputs: vec![OAK_PLANKS, COPPER_INGOT],
+                output: ItemStack { id: ACACIA_PLANKS, count: 2 },
+            },
+            Recipe::CraftingShapeless {
+                inputs: vec![OAK_PLANKS, COAL_ORE],
+                output: ItemStack { id: DARK_OAK_PLANKS, count: 2 },
+            },
+            // 4 Sand -> 1 Sandstone
+            Recipe::CraftingShaped {
+                width: 2,
+                height: 2,
+                inputs: vec![Some(SAND), Some(SAND), Some(SAND), Some(SAND)],
+                output: ItemStack { id: SANDSTONE, count: 1 },
+            },
+            // 6 Oak Planks + 3 Dirt/Paper -> 1 Bookshelf
+            Recipe::CraftingShaped {
+                width: 3,
+                height: 3,
+                inputs: vec![
+                    Some(OAK_PLANKS), Some(OAK_PLANKS), Some(OAK_PLANKS),
+                    Some(SAND),       Some(SAND),       Some(SAND),
+                    Some(OAK_PLANKS), Some(OAK_PLANKS), Some(OAK_PLANKS),
+                ],
+                output: ItemStack { id: BOOKSHELF, count: 1 },
             },
             // 2 Dirt + 2 Stone -> 1 Storage Chest (compact 2x2 recipe)
             Recipe::CraftingShaped {
