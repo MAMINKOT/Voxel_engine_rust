@@ -4,4 +4,5 @@ pub mod pipeline;
 pub mod postprocess;
 pub mod shadows;
 pub mod sky;
+pub mod texture;
 pub mod ui;

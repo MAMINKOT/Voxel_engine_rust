@@ -370,15 +370,24 @@ impl ExplosionSystem {
                 ),
             ];
 
-            for (corners, normal, color) in faces {
+            const TNT_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+            let tex_layer = if flash_white {
+                crate::voxel::blocks::NO_TEXTURE
+            } else {
+                crate::voxel::blocks::TextureLayer::TntSide as u32
+            };
+            let face_tint = if flash_white { side_color } else { [1.0, 1.0, 1.0] };
+            for (corners, normal, _color) in faces {
                 let base = vertices.len() as u32;
-                for position in corners {
+                for (idx, position) in corners.into_iter().enumerate() {
                     vertices.push(Vertex {
                         position,
                         normal,
-                        color,
+                        color: face_tint,
                         light: [15.0, 15.0, 15.0, 15.0],
                         ao_and_flags: [3.0, 0.0],
+                        uv: TNT_UVS[idx],
+                        tex_layer,
                     });
                 }
                 indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);

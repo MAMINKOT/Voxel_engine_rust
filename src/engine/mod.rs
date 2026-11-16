@@ -34,6 +34,7 @@ use crate::render::pipeline::{
 use crate::render::postprocess::PostProcessor;
 use crate::render::shadows::ShadowRenderer;
 use crate::render::sky::SkyState;
+use crate::render::texture::BlockTextureArray;
 use crate::render::ui::{UiScreen, UiSystem};
 use crate::sim::energy_net::TICK_DT;
 use crate::ui::debug::DebugInfo;
@@ -85,6 +86,7 @@ struct GpuState {
     scene_depth_copy: DepthTexture,
     shadows: ShadowRenderer,
     clouds: CloudRenderer,
+    block_textures: BlockTextureArray,
     scene_env_bgl: wgpu::BindGroupLayout,
     scene_env_bg: wgpu::BindGroup,
     postprocess: PostProcessor,
@@ -187,6 +189,8 @@ impl Engine {
             &self.gpu.shadows.view,
             &self.gpu.shadows.sampler,
             &self.gpu.scene_depth_copy.view,
+            &self.gpu.block_textures.view,
+            &self.gpu.block_textures.sampler,
         );
         self.gpu.postprocess.resize(
             &self.gpu.device,
@@ -810,6 +814,7 @@ async fn init_gpu(window: Arc<Window>) -> GpuState {
         "scene_depth_copy",
     );
 
+    let block_textures = BlockTextureArray::load(&device, &queue);
     let scene_env_bgl = create_scene_env_bind_group_layout(&device);
     let scene_env_bg = create_scene_env_bind_group(
         &device,
@@ -817,6 +822,8 @@ async fn init_gpu(window: Arc<Window>) -> GpuState {
         &shadows.view,
         &shadows.sampler,
         &scene_depth_copy.view,
+        &block_textures.view,
+        &block_textures.sampler,
     );
 
     let sky_pipeline = create_sky_pipeline(&device, &cam_bgl);
@@ -847,6 +854,7 @@ async fn init_gpu(window: Arc<Window>) -> GpuState {
         scene_depth_copy,
         shadows,
         clouds,
+        block_textures,
         scene_env_bgl,
         scene_env_bg,
         postprocess,

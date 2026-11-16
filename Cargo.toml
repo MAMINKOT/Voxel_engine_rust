@@ -39,6 +39,9 @@ rayon = "1.10"
 # Process & system RAM monitoring for F3 debug overlay
 sysinfo = "0.30"
 
+# PNG texture loading & CPU preprocessing (crop, grayscale tinting, overlay compositing)
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [profile.dev]
 opt-level = 1          # faster incremental builds with some optimisations
 

@@ -279,12 +279,22 @@ pub fn build_drops_mesh(items: &[ItemDrop]) -> (Vec<Vertex>, Vec<u32>) {
         let bob = (drop.lifetime * 3.2).sin() * 0.05 + 0.05;
         let center = drop.position + Vec3::Y * bob;
         let rot = Mat3::from_rotation_y(angle);
-        let color = block_color(drop.block_id);
+        let tex_layer = crate::voxel::blocks::get_face_texture(
+            drop.block_id,
+            crate::voxel::blocks::BlockFace::PosZ,
+            false,
+        );
+        let color = if tex_layer != crate::voxel::blocks::NO_TEXTURE {
+            crate::voxel::blocks::texture_tint_color(drop.block_id, 1)
+        } else {
+            block_color(drop.block_id)
+        };
+        const DROP_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
 
         for (corners, normal) in FACES {
             let base = vertices.len() as u32;
             let n = (rot * normal).to_array();
-            for c in corners {
+            for (idx, c) in corners.into_iter().enumerate() {
                 let p = (center + rot * c).to_array();
                 vertices.push(Vertex {
                     position: p,
@@ -292,6 +302,8 @@ pub fn build_drops_mesh(items: &[ItemDrop]) -> (Vec<Vertex>, Vec<u32>) {
                     color,
                     light: [12.0, 12.0, 12.0, 15.0],
                     ao_and_flags: [3.0, 0.0],
+                    uv: DROP_UVS[idx],
+                    tex_layer,
                 });
             }
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);

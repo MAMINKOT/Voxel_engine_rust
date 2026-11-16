@@ -1,3 +1,4 @@
+pub mod blocks;
 pub mod chunk;
 pub mod drops;
 pub mod fluid;

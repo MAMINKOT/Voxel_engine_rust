@@ -5,10 +5,13 @@
 
 use glam::{IVec3, Vec3};
 
+use crate::voxel::blocks::{
+    get_face_texture, texture_tint_color, BlockFace, TextureLayer, NO_TEXTURE,
+};
 use crate::voxel::chunk::{
-    base_block_id, block_color, block_face_color, fluid_level_from_id, is_active_block,
-    is_energy_connectable, is_fluid, is_full_cube, is_solid_block, is_translucent, BlockId, AIR,
-    CABLE, CABLE_MAX, CABLE_MIN, CHUNK_SIZE, FIRE, LAVA, PURPLE_STAINED_GLASS, TORCH, WATER,
+    base_block_id, block_face_color, fluid_level_from_id, is_active_block, is_energy_connectable,
+    is_fluid, is_full_cube, is_solid_block, is_translucent, BlockId, AIR, CABLE, CABLE_MAX,
+    CABLE_MIN, CHUNK_SIZE, FIRE, LAVA, OAK_LEAVES, PURPLE_STAINED_GLASS, TORCH, WATER,
 };
 use crate::voxel::light::{
     blue_channel, green_channel, light_to_f32_array, pack_light, red_channel, sun_channel,
@@ -30,8 +33,12 @@ pub struct Vertex {
     pub color: [f32; 3],
     /// `[Red, Green, Blue, Sunlight]`, each in `0.0..=15.0`.
     pub light: [f32; 4],
-    /// `[ao_level (0.0..=3.0), material_flag (0=standard, 1=water, 2=glass, 3=fire)]`.
+    /// `[ao_level (0.0..=3.0), material_flag (0=standard, 1=water, 2=glass, 3=fire, 4=emissive)]`.
     pub ao_and_flags: [f32; 2],
+    /// Tiled UV coordinates (`[0..w, 0..h]`) for `AddressMode::Repeat`.
+    pub uv: [f32; 2],
+    /// Layer index in the `texture_2d_array<f32>` (`NO_TEXTURE` = untextured vertex color).
+    pub tex_layer: u32,
 }
 
 pub struct MeshData {
@@ -134,7 +141,9 @@ where
                         q[d] += step;
 
                         let b = sample(p[0], p[1], p[2]);
-                        let visible = is_full_cube(b) && !is_full_cube(sample(q[0], q[1], q[2]));
+                        let nb = sample(q[0], q[1], q[2]);
+                        let visible = is_full_cube(b)
+                            && (!is_full_cube(nb) || base_block_id(nb) == OAK_LEAVES);
                         if visible {
                             opaque.naive_faces += 1;
                             let mut fl = sample_light(q[0], q[1], q[2]);
@@ -270,11 +279,25 @@ fn emit_quad(
 
     let mut normal = [0.0f32; 3];
     normal[d] = if positive { 1.0 } else { -1.0 };
-    let color = block_face_color(block, d);
-    let mat_flag = if is_active_block(block) {
-        MAT_EMISSIVE
+    let face = BlockFace::from_axis(d, positive);
+    let active = is_active_block(block);
+    let tex_layer = get_face_texture(block, face, active);
+    let color = if tex_layer != NO_TEXTURE {
+        texture_tint_color(block, d)
     } else {
-        MAT_STANDARD
+        block_face_color(block, d)
+    };
+    let mat_flag = if active { MAT_EMISSIVE } else { MAT_STANDARD };
+
+    let wf = w as f32;
+    let hf = h as f32;
+    let uvs: [[f32; 2]; 4] = match d {
+        // ±X: u = Y (w), v = Z (h) -> keep V upright (-Y) and U horizontal (Z)
+        0 => [[0.0, wf], [0.0, 0.0], [hf, 0.0], [hf, wf]],
+        // ±Y: u = Z (w), v = X (h)
+        1 => [[0.0, 0.0], [wf, 0.0], [wf, hf], [0.0, hf]],
+        // ±Z: u = X (w), v = Y (h) -> keep V upright (-Y) and U horizontal (X)
+        _ => [[0.0, hf], [wf, hf], [wf, 0.0], [0.0, 0.0]],
     };
 
     let base = data.vertices.len() as u32;
@@ -294,6 +317,8 @@ fn emit_quad(
             color,
             light,
             ao_and_flags: [ao[idx] as f32, mat_flag],
+            uv: uvs[idx],
+            tex_layer,
         });
     }
 
@@ -397,7 +422,16 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
     sample: &F,
 ) {
     let base = base_block_id(raw);
-    let color = block_face_color(raw, 1);
+    let tex_layer = if base == LAVA {
+        TextureLayer::LavaStill as u32
+    } else {
+        NO_TEXTURE
+    };
+    let color = if tex_layer != NO_TEXTURE {
+        [1.0, 1.0, 1.0]
+    } else {
+        block_face_color(raw, 1)
+    };
     let mat_flag = if base == WATER {
         MAT_WATER
     } else if base == LAVA {
@@ -418,6 +452,7 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
                      positions: [[f32; 3]; 4],
                      normal: [f32; 3],
                      top_flags: [f32; 4]| {
+        const QUAD_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
         let base_idx = data.vertices.len() as u32;
         for i in 0..4 {
             data.vertices.push(Vertex {
@@ -426,6 +461,8 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
                 color,
                 light,
                 ao_and_flags: [top_flags[i], mat_flag],
+                uv: QUAD_UVS[i],
+                tex_layer,
             });
         }
         data.indices.extend_from_slice(&[
@@ -548,14 +585,15 @@ fn emit_fluid_voxel<F: Fn(i32, i32, i32) -> BlockId>(
 /// Emits a glowing translucent fire sub-block (`[0.12..0.88]` on X/Z, `[0.0..0.82]` on Y).
 fn emit_fire_voxel(data: &mut MeshData, world_pos: IVec3) {
     let base_pos = world_pos.as_vec3();
-    let color = block_face_color(FIRE, 1);
-    emit_box_with_flag(
+    emit_box_with_custom_top_ao(
         data,
         base_pos + Vec3::new(0.12, 0.0, 0.12),
         base_pos + Vec3::new(0.88, 0.82, 0.88),
-        color,
+        [1.0, 1.0, 1.0],
         [15.0, 8.0, 2.0, 15.0],
+        3.0,
         MAT_FIRE,
+        TextureLayer::FireLayer0 as u32,
         [true, true, true, false, true, true],
     );
 }
@@ -608,13 +646,15 @@ fn emit_stained_glass<F: Fn(i32, i32, i32) -> BlockId>(
         vis(lx, ly, lz - 1),
     ];
     let bmin = world_pos.as_vec3();
-    emit_box_with_flag(
+    emit_box_with_custom_top_ao(
         data,
         bmin,
         bmin + Vec3::ONE,
-        block_face_color(PURPLE_STAINED_GLASS, 1),
+        [1.0, 1.0, 1.0],
         light,
+        3.0,
         MAT_STAINED_GLASS,
+        TextureLayer::GlassMagenta as u32,
         faces,
     );
 }
@@ -631,7 +671,7 @@ fn emit_cable<F: Fn(i32, i32, i32) -> BlockId>(
     sample: &F,
 ) {
     let base_pos = world_pos.as_vec3();
-    let color = block_color(CABLE);
+    let color = crate::voxel::chunk::block_color(CABLE);
     let c0 = CABLE_MIN;
     let c1 = CABLE_MAX;
 
@@ -735,7 +775,17 @@ fn emit_box_with_flag(
     mat_flag: f32,
     faces: [bool; 6],
 ) {
-    emit_box_with_custom_top_ao(data, min, max, color, light, 3.0, mat_flag, faces);
+    emit_box_with_custom_top_ao(
+        data,
+        min,
+        max,
+        color,
+        light,
+        3.0,
+        mat_flag,
+        NO_TEXTURE,
+        faces,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -747,6 +797,7 @@ fn emit_box_with_custom_top_ao(
     light: [f32; 4],
     top_ao_or_mask: f32,
     mat_flag: f32,
+    tex_layer: u32,
     faces: [bool; 6],
 ) {
     let (x0, y0, z0) = (min.x, min.y, min.z);
@@ -797,18 +848,21 @@ fn emit_box_with_custom_top_ao(
         ),
     ];
 
+    const UNIT_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
     for (enabled, corners, normal, ao_val) in quads {
         if !enabled {
             continue;
         }
         let base = data.vertices.len() as u32;
-        for position in corners {
+        for (idx, position) in corners.into_iter().enumerate() {
             data.vertices.push(Vertex {
                 position,
                 normal,
                 color,
                 light,
                 ao_and_flags: [ao_val, mat_flag],
+                uv: UNIT_UVS[idx],
+                tex_layer,
             });
         }
         data.indices
